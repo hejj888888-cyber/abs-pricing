@@ -1,0 +1,137 @@
+{
+  "case_name": "鼎柚2025年第三期个人消费贷款资产支持证券（中原消金）",
+  "case_id": "dingyou-2025-3",
+  "data_status": "真实披露参数",
+  "source": {
+    "name": "联合资信《鼎柚2025年第三期个人消费贷款资产支持证券信用评级报告》（联合〔2025〕3397号，2025-05-23）",
+    "url": "https://www.lhratings.com/reports/A014622-P80573-2025.pdf"
+  },
+  "pool": {
+    "balance": 1503189400,
+    "annual_yield": 0.2115,
+    "monthly_repayment_rate": 0.1987,
+    "charge_off_rate": 0.0314,
+    "recovery_rate": 0.1,
+    "recovery_lag_months": 6,
+    "servicing_fee_rate": 0.005,
+    "revolving_months": 6,
+    "amort_months": 12,
+    "reinvest_rate": 1.0,
+    "seasoning_months": 5
+  },
+  "structure": {
+    "pay_mode": "sequential",
+    "trigger_cdr": 0.06
+  },
+  "tranches": [
+    {
+      "name": "优先A",
+      "share": 0.7444,
+      "rating": "AAA",
+      "mode": "solve",
+      "target_yield": 0.0205,
+      "reference_yield": 0.015
+    },
+    {
+      "name": "优先B",
+      "share": 0.0579,
+      "rating": "AA+",
+      "mode": "solve",
+      "target_yield": 0.023,
+      "reference_yield": 0.015
+    },
+    {
+      "name": "优先C",
+      "share": 0.1031,
+      "rating": "A+",
+      "mode": "solve",
+      "target_yield": 0.045,
+      "reference_yield": 0.015
+    },
+    {
+      "name": "次级",
+      "share": 0.0925,
+      "rating": "未评级",
+      "mode": "residual",
+      "reference_yield": 0.015,
+      "income_rate": 0.03
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "base",
+      "label": "基准情景",
+      "note": "披露值：核销率 3.14%、月还款率 19.87%、购买率 100%",
+      "co_mult": 1.0,
+      "mrr_mult": 1.0,
+      "recovery_mult": 1.0,
+      "yield_mult": 1.0
+    },
+    {
+      "id": "stress",
+      "label": "压力情景",
+      "note": "核销率×2、月还款率×0.8、回收率×0.6",
+      "co_mult": 2.0,
+      "mrr_mult": 0.8,
+      "recovery_mult": 0.6,
+      "yield_mult": 1.0
+    },
+    {
+      "id": "severe",
+      "label": "极端情景",
+      "note": "核销率×3、月还款率×0.7、回收率×0.4、收益率×0.95",
+      "co_mult": 3.0,
+      "mrr_mult": 0.7,
+      "recovery_mult": 0.4,
+      "yield_mult": 0.95
+    }
+  ],
+  "disclosed_support": {
+    "优先A": 0.2556,
+    "优先B": 0.1977,
+    "优先C": 0.0946
+  },
+  "param_sources": {
+    "balance": [
+      "披露",
+      "初始资产池未偿本金 150,318.94 万元（含超额抵押 318.94 万元）"
+    ],
+    "annual_yield": [
+      "披露",
+      "加权平均现行贷款年利率 21.15%"
+    ],
+    "charge_off_rate": [
+      "披露",
+      "量化参数·核销率 3.14%（历史静态池平均）"
+    ],
+    "monthly_repayment_rate": [
+      "披露",
+      "量化参数·月还款率 19.87%"
+    ],
+    "reinvest_rate": [
+      "披露",
+      "量化参数·购买率 100%"
+    ],
+    "recovery_rate": [
+      "假设",
+      "报告未披露核销后回收率，按消费贷核销后回收 10% 假设"
+    ],
+    "recovery_lag_months": [
+      "假设",
+      "按 6 个月假设"
+    ],
+    "servicing_fee_rate": [
+      "假设",
+      "报告未列服务费率，按 0.5%/年假设"
+    ],
+    "revolving_months": [
+      "假设",
+      "持续购买期未在摘录中给出，按 6 个月、与优先A 预期到期日（发行后约 13 个月）匹配"
+    ],
+    "amort_months": [
+      "假设",
+      "摊还期上限按 12 个月"
+    ]
+  },
+  "tranche_sources": "分层占比取自评级报告交易概览表（按资产占比口径），加总 99.79%，余额 0.21% 为超额抵押"
+}

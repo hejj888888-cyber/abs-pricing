@@ -60,21 +60,16 @@ def solve_coupons(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
 
 
 def tranche_metrics(result, tranche):
+    """单档指标。本金流单独取自 WaterfallResult.principal，不把利差当本金。"""
     notional = result.notional[tranche.name]
     cfs = result.cashflow[tranche.name]
-    unpaid = result.unpaid_principal[tranche.name]
+    prs = result.principal[tranche.name]
 
-    wal = 0.0
-    remaining = notional
-    for i, cf in enumerate(cfs):
-        # 按月分摊：当月现金流先冲利息，其余视为本金
-        interest = 0.0 if tranche.mode == "residual" else tranche.coupon * remaining / 12.0
-        pr = max(0.0, cf - interest)
-        wal += (i + 1) / 12.0 * pr
-        remaining -= pr
-    wal = wal / notional if notional else 0.0
-
+    paid_principal = sum(prs)
+    unpaid = max(notional - paid_principal, 0.0)
+    wal = sum((i + 1) / 12.0 * p for i, p in enumerate(prs)) / notional if notional else 0.0
     realized = irr(cfs, notional)
+
     return {
         "档位": tranche.name,
         "评级": tranche.rating,
