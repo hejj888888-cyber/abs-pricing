@@ -33,6 +33,14 @@ python scripts/run_case.py
 
 改参数只需编辑 `cases/consumer_abs_base.json`，不用动代码。
 
+### 怎么验证它算得对
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+11 项冒烟测试，覆盖最容易错的四件事：年金公式、SMM/MDR 换算、现金流守恒、票面反解是否命中目标收益率。全部通过才提交。
+
 ## 三、模型结构（四层，逐层可单独验证）
 
 ```
