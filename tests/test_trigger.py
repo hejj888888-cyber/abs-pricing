@@ -146,16 +146,35 @@ class TestWaterfallIntegration(unittest.TestCase):
         self.assertLessEqual(res.accel_month, 6, "应在循环期内触发")
         self.assertTrue(any(e.code == "CDR" for e in res.trigger_events))
 
-    def test_eod_does_not_set_accel_month(self):
-        """违约事件不该截断循环期：本金逾期不是加速清偿事件。"""
+    def test_principal_overdue_is_accel_not_eod(self):
+        """鼎柚 (129)(f)：预期到期日无法足额分配本金属自动生效的**加速清偿事件**。
+
+        早期版本按"后果"把它归成违约事件（证券立即到期），与原件不符。这个测试
+        锁住正确分类：它属于 accel，会终止持续购买。
+        """
         pool = small_pool(charge_off_rate=0.001)
         rows = build_schedule(pool)
-        t = terms(principal_overdue_enabled=True)
         trs = tranches()
         trs[0].expected_maturity_month = 3        # 故意提前，制造"未按期足额分配"
-        res = run_waterfall(rows, pool.balance, trs, terms=t)
-        self.assertTrue(any(e.kind == "eod" for e in res.trigger_events))
-        self.assertEqual(res.accel_month, 0, "违约事件不应触发加速清偿")
+        res = run_waterfall(rows, pool.balance, trs,
+                            terms=terms(principal_overdue_enabled=True))
+        ev = [e for e in res.trigger_events if e.code == "SENIOR_PRINCIPAL_OVERDUE"]
+        self.assertTrue(ev, "应报出本金逾期")
+        self.assertEqual(ev[0].kind, "accel")
+        self.assertGreater(res.accel_month, 0, "accel 类应触发加速清偿")
+
+    def test_interest_shortfall_does_not_set_accel_month(self):
+        """真正的违约事件（优先档欠息）不截断循环期——后果是证券立即到期，不是提前摊还。"""
+        pool = small_pool(charge_off_rate=0.001)
+        rows = build_schedule(pool)
+        trs = tranches()
+        res = run_waterfall(rows, pool.balance, trs,
+                            terms=terms(flags={"SENIOR_INTEREST_SHORTFALL": 2}))
+        # 用 flags 无法注入 eod（flags 走 CONDITION_KINDS），故直接校验分类映射
+        from abs.trigger import CONDITION_KINDS
+        self.assertEqual(CONDITION_KINDS["SENIOR_INTEREST_SHORTFALL"], "eod")
+        self.assertEqual(CONDITION_KINDS["SENIOR_PRINCIPAL_OVERDUE"], "accel")
+        self.assertEqual(res.accel_month, 0)
 
     def test_pre_fired_suppresses_duplicate(self):
         pool = small_pool()

@@ -67,13 +67,18 @@ class WaterfallResult:
 
 
 def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_cdr=0.06,
-                  terms=None, pre_fired=None, excess_sweep=False):
+                  terms=None, pre_fired=None, excess_sweep=0.0):
     """terms 不为 None 时启用多条件触发；否则退回单一累计核销率阈值。
 
-    pre_fired   已判定触发的条件代号集合。加速清偿一旦发生不可逆，重跑时不能再
-                把同一个条件当成"新事件"记录，故由调用方传进来。
-    excess_sweep True 表示收入分账剩余作为超额服务费归服务商（说明书通常不披露该费率，
-                因其按剩余金额结算）。默认 False，即剩余全部归次级。
+    pre_fired      已判定触发的条件代号集合。加速清偿一旦发生不可逆，重跑时不能再
+                   把同一个条件当成"新事件"记录，故由调用方传进来。
+    excess_sweep   期末剩余中作为**后端服务报酬**归服务商的比例，[0, 1]。
+
+                   鼎柚说明书分配顺序末端：(f) 支付后端服务报酬 → (g) 剩余全部作为
+                   次级收益。也就是说次级收益是**扣完后端报酬之后的余额**，而后端
+                   报酬的计算方式由《收费文件》约定，该文件不公开。
+                   因此 0 与 1 分别给出次级收益率的上界与下界，真实值在区间内。
+                   默认 0（上界），与早期版本一致。
     """
     names = [t.name for t in tranches]
     notional = {t.name: t.share * pool_balance for t in tranches}
@@ -85,7 +90,10 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
     excess_servicing = 0.0
     accel_month = 0
     res = tranches[-1]
-    res_income = (res.income_rate * notional[res.name] / 12.0) if res.income_rate else 0.0
+    # 次级期间收益按**当期未偿本金余额**计（鼎柚说明书 p.92-93：
+    # 最高期间收益 = 该支付日本金兑付前的未偿本金余额 × 3%/年 × 计息期间天数 ÷ 365，
+    # 单利；首期以信托生效日面值为基数）。早期版本按发行面值固定计，基数偏大。
+    res_income_rate = res.income_rate / 12.0 if res.income_rate else 0.0
     events = []
     fired = set(pre_fired or ())
 
@@ -117,33 +125,9 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
             unpaid_in[t.name] += due - pay
             cf[t.name].append(pay)
 
-        # 2) 触发判定
-        if terms is not None:
-            from .trigger import evaluate_month
-
-            if terms.principal_overdue_enabled:
-                overdue = [t.name for t in tranches
-                           if t.mode != "residual" and t.expected_maturity_month
-                           and row["month"] > t.expected_maturity_month
-                           and balances[t.name] > 1.0]
-            else:
-                overdue = []   # 见 trigger.py 模块说明：模型摊还偏差会误报
-            senior_unpaid = {t.name: unpaid_in[t.name] for t in tranches
-                             if t.mode != "residual"}
-            new_events = evaluate_month(row["month"], row["cum_charge_off_rate"],
-                                        senior_unpaid, overdue, terms, fired)
-            if new_events:
-                events.extend(new_events)
-                # 只有加速清偿事件会终止持续购买；违约事件的后果是证券提前到期，
-                # 不改变循环期长度。见 trigger.py「加速清偿事件 ≠ 违约事件」。
-                if accel_month == 0 and any(e.kind == "accel" for e in new_events):
-                    accel_month = row["month"]
-        elif accel_month == 0 and row["cum_charge_off_rate"] > trigger_cdr:
-            accel_month = row["month"]
-
         accelerated = accel_month != 0
 
-        # 3) 本金。循环购买期不分配本金（见模块顶部说明）。
+        # 2) 本金。循环购买期不分配本金（见模块顶部说明）。
         if row["phase"] == "revolving":
             pass
         elif pay_mode == "sequential" or accelerated:
@@ -165,19 +149,53 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
                     cf[t.name][-1] += principal
                     pr[t.name][-1] += principal
 
+        # 3) 触发判定（放在本金分配之后）
+        #    原因：本金逾期条件要看「分配后是否还有余额」。放在分配前，
+        #    优先档在预期到期日当月刚要还清时会被误判为逾期——鼎柚基准情景
+        #    就是这样被误报了一条加速清偿。
+        #    副作用：触发当月的分配方式不变，从下月起才按加速后执行，
+        #    这与「事件发生后次一分配日起生效」的实务处理一致。
+        if terms is not None:
+            from .trigger import evaluate_month
+
+            if terms.principal_overdue_enabled:
+                # 判定点：原件是「预期到期日前一个信托分配日」预判能否足额分配；
+                # 模型按「预期到期日当月末仍未清偿」近似，时点晚约 1 个月。
+                overdue = [t.name for t in tranches
+                           if t.mode != "residual" and t.expected_maturity_month
+                           and row["month"] >= t.expected_maturity_month
+                           and balances[t.name] > 1.0]
+            else:
+                overdue = []   # 见 trigger.py 模块说明：模型摊还偏差会误报
+            senior_unpaid = {t.name: unpaid_in[t.name] for t in tranches
+                             if t.mode != "residual"}
+            # 用合同口径的累计违约率：分母含历次持续购买本金
+            cdr = row.get("cum_default_rate", row["cum_charge_off_rate"])
+            new_events = evaluate_month(row["month"], cdr,
+                                        senior_unpaid, overdue, terms, fired)
+            if new_events:
+                events.extend(new_events)
+                # 只有加速清偿事件会终止持续购买；违约事件的后果是证券提前到期，
+                # 不改变循环期长度。见 trigger.py「加速清偿事件 ≠ 违约事件」。
+                if accel_month == 0 and any(e.kind == "accel" for e in new_events):
+                    accel_month = row["month"]
+        elif accel_month == 0 and row["cum_charge_off_rate"] > trigger_cdr:
+            accel_month = row["month"]
+
         # 4) 剩余：次级期间收益封顶，超额留存或归服务商
         if avail > 1e-9:
-            if res_income > 0:
-                pay = min(res_income, avail)
+            if res_income_rate:
+                # 可分配资金不足时，不足部分下一期不予补足（够花说明书 p.44）
+                pay = min(res_income_rate * balances[res.name], avail)
                 cf[res.name][-1] += pay
                 avail -= pay
-            if excess_sweep:
-                excess_servicing += avail
-            else:
-                reserve += avail
+            reserve += avail
 
     if reserve > 0 and cf[res.name]:
-        cf[res.name][-1] += reserve
+        # 期末释放：先支付后端服务报酬，余额才归次级（鼎柚说明书分配顺序 (f)→(g)）
+        fee = reserve * max(min(excess_sweep, 1.0), 0.0)
+        excess_servicing += fee
+        cf[res.name][-1] += reserve - fee
 
     return WaterfallResult(
         cashflow=cf,

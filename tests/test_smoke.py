@@ -67,6 +67,33 @@ class TestCashflow(unittest.TestCase):
         for prev, cur in zip(amort, amort[1:]):
             self.assertLessEqual(cur["bal_begin"], prev["bal_begin"] + 1e-6)
 
+    def test_repayment_rate_is_on_initial_not_current_balance(self):
+        """月还款率的分母是静态池初始放款金额，不是当期余额。
+
+        联合资信评级方法 p.5：月还款率 = 静态池当月收到的本金 / 静态池初始放款金额。
+        所以每月本金回款额近似常数（水平偿还），不是几何衰减。这个区别决定了
+        优先档清偿月对不对得上披露的预期到期日。
+        """
+        p = sample_pool(revolving_months=0, charge_off_rate=0.0, recovery_rate=0.0)
+        rows = build_schedule(p)
+        amort = [r["principal"] for r in rows if r["phase"] == "amortizing"]
+        self.assertAlmostEqual(amort[0] / p.balance, p.monthly_repayment_rate, places=9)
+        # 水平偿还：只要余额还够，后续月份回款额与首月相同（几何衰减会逐月变小）
+        for v in amort[:-1]:
+            self.assertAlmostEqual(v, amort[0], delta=1.0)
+        # 池子应在约 1/月还款率 个月内摊完，而不是永远摊不完
+        self.assertLessEqual(len(amort), int(1.0 / p.monthly_repayment_rate) + 2)
+
+    def test_cum_default_rate_denominator_includes_purchases(self):
+        """合同口径的累计违约率分母 = 初始余额 + 累计持续购买本金（累加不扣减）。"""
+        p = sample_pool(revolving_months=6)
+        rows = build_schedule(p)
+        rev = [r for r in rows if r["phase"] == "revolving"]
+        last = rev[-1]
+        self.assertGreater(last["cum_purchased"], p.balance * 0.5)
+        # 分母膨胀 → 合同口径显著低于"占初始余额"口径
+        self.assertLess(last["cum_default_rate"], last["cum_charge_off_rate"] * 0.7)
+
 
 class TestWaterfall(unittest.TestCase):
     def test_conservation(self):

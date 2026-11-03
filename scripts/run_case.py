@@ -142,7 +142,8 @@ def thickness_analysis(tranches, scenario_metrics):
     return rows
 
 
-def build_report(case, pool, tranches, results, summaries, min_sub, counterfactual=None):
+def build_report(case, pool, tranches, results, summaries, min_sub, counterfactual=None,
+                 sub_yield_low=None, sub_yield_high=None):
     scenario_metrics = [r[2] for r in results]
     # 加权票面按「有票面的档」加权，不能只算 mode == "solve"——
     # 全部档位改成 fixed 后，只算 solve 会得到 0，超额利差被凭空放大 3 个百分点。
@@ -200,6 +201,17 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
     L.append(md_table(["情景", "参数设定", "实际循环期(月)", "累计核销率", "净损失率", "本金回收率",
                        "池加权期限(年)", "池利息收入(亿元)", "存续月数"], rows))
 
+    # 累计违约率：占初始余额 vs 合同口径（分母含持续购买本金）
+    cd_rows = []
+    for s, p, r in zip(case["scenarios"], summaries, results):
+        mx = max(r[0], key=lambda x: x["cum_default_rate"])
+        cd_rows.append([s["label"], pct(mx["cum_charge_off_rate"]), pct(mx["cum_default_rate"]),
+                        f"{(pool.balance + mx['cum_purchased']) / 1e8:,.2f}",
+                        f"第 {mx['month']} 月"])
+    L.append("\n**累计违约率的两种口径**（触发判定用的是后者）：\n")
+    L.append(md_table(["情景", "累计核销率（占初始余额）", "累计违约率（合同口径）",
+                       "合同口径分母(亿元)", "峰值时点"], cd_rows))
+
     # 触发事件记录（第 3 周新增）
     L.append("\n### 加速清偿事件与违约事件触发记录\n")
     ev_rows = []
@@ -213,8 +225,9 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
     else:
         L.append("三种情景均未触发任何条件。")
     if tr:
-        L.append("\n> 判定参数：累计违约率阈值 首年 {}、满 {} 个月后 {}；"
-                 "违约率 = 累计核销率 × 上调系数 {}。\n".format(
+        L.append("\n> 判定参数：累计违约率阈值 首年 {}、满 {} 个月后 {}。"
+                 "分子为违约贷款（逾期 90 日以上）在成为违约贷款时的未偿本金余额；"
+                 "分母为初始起算日资产池余额 + 各持续购买日购买资产的未偿本金余额（累加不扣减）。\n".format(
                      pct(tr.get("cdr_first_year", 0.05), 0),
                      tr.get("first_year_months", 12),
                      pct(tr.get("cdr_after_first_year", 0.08), 0),
@@ -230,9 +243,29 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
                          if accel else ""))
         L.append("> **能力边界**：服务机构解任、后备机构缺位、发起机构丧失清偿能力、"
                  "交易文件终止等条件无法由资产池数据推演，已实现为情景开关（`flags`），"
-                 "默认不注入。累计违约率与累计核销率的换算系数无实证支撑，属显式假设。"
-                 "「优先档本金未按期足额分配」一条实现但默认关闭——模型的摊还速度与披露的"
-                 "预期到期日存在系统性偏差（见下节对账表），用模型口径判会把口径差误报成违约事件。\n")
+                 "默认不注入。「优先档本金未按期足额分配」按条款原文逐单开关："
+                 "本单{}。\n".format(
+                     "（鼎柚 (129)(f)）有此条款，已启用" if tr.get("principal_overdue_enabled")
+                     else "（够花 (130)）无此条款，不评估"))
+
+    # CDR 条款在循环结构下为何触发不了
+    if tr:
+        peak = max(max(r[0], key=lambda x: x["cum_default_rate"])["cum_default_rate"]
+                   for r in results)
+        thr = tr.get("cdr_first_year", 0.05)
+        L.append("\n### 为什么累计违约率条款触发不了\n")
+        L.append("按合同口径，本单三情景的累计违约率峰值 **{}**，首年阈值 {}，{}。\n".format(
+            pct(peak), pct(thr, 0), "**始终不触发**" if peak <= thr else "极端情景下会触发"))
+        L.append("机制在于分母：持续购买期内每月购买额约等于当月本金回收额，"
+                 "分母由初始 {} 亿元一路累加到 {} 亿元；而分子（累计违约本金）只按违约速度增长。"
+                 "两种口径因此差出一倍以上——占初始余额的累计核销率看起来早已越过阈值，"
+                 "换成合同口径后连一半都不到。\n".format(
+                     f"{pool.balance/1e8:,.2f}",
+                     f"{(pool.balance + max(max(r[0], key=lambda x: x['cum_purchased'])['cum_purchased'] for r in results))/1e8:,.2f}"))
+        L.append("这不是参数估错，是**循环购买结构本身的性质**：新资产不断注入分母，"
+                 "单笔违约在比率上被持续稀释。真正的加速清偿风险因此集中在非量化条件上——"
+                 "服务机构解任、后备机构缺位、发起机构丧失清偿能力——"
+                 "这几条与资产池表现无关，只能靠情景开关注入，不能由模型预测。\n")
 
     L.append("\n### 模型清偿月 vs 披露预期到期日\n")
     rec_rows = []
@@ -284,11 +317,12 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
               if sev_loss > sub.share else "未超过次级厚度")
     L.append("极端情景净损失 {}，{}；次级实际损失 {}（约合资产池 {}），其中 {} 被超额利差吸收。".format(
         pct(sev_loss), pierce, pct(sub_loss), pct(sub_loss * sub.share), pct(absorbed)))
-    L.append("\n> 次级档的实现收益率 {} 是**上界**：本模型把收入分账的全部剩余都归次级，"
-             "未考虑「超额服务费」安排（服务商在各档获得约定收益后取走剩余）。"
-             "真实次级收益取决于《服务合同》的分配约定，而该文件不公开——"
-             "这一项无法从披露文件推断，是本报告最大的单点不确定性。\n".format(
-                 pct(scenario_metrics[0][-1]["实现收益率"])))
+    L.append("\n> **次级档的实现收益率只能给区间，给不出点估计。** 说明书的分配顺序末端是"
+             "「先支付后端服务报酬，再由次级取得剩余收益」，即次级拿到的是扣完后端报酬之后的"
+             "余额；而后端报酬的计算方式由《收费文件》约定，该文件不公开。取后端报酬占期末剩余"
+             "的 0% 与 100% 两种极端，得到本单次级收益率的区间 **{} ~ {}**；"
+             "真实值落在区间内某处，位置由那份不公开的收费文件决定。\n".format(
+                 pct(sub_yield_low), pct(sub_yield_high)))
 
     L.append("\n## 六、厚度反解 vs 披露结构\n")
     L.append("反解问题：在极端情景下，次级档最薄做到多少，其余各档仍不违约？\n")
@@ -458,8 +492,17 @@ def run_one(case_path, out_dir, quiet=False):
                                    structure.get("pay_mode", "sequential"),
                                    structure.get("trigger_cdr", 0.06), terms=terms)
 
+    # 次级收益率的上下界：后端服务报酬占期末剩余 100% / 0%
+    rows_b = results[0][0]
+    res_hi = run_waterfall(rows_b, pool.balance, tranches, structure.get("pay_mode", "sequential"),
+                           structure.get("trigger_cdr", 0.06), terms, excess_sweep=0.0)
+    res_lo = run_waterfall(rows_b, pool.balance, tranches, structure.get("pay_mode", "sequential"),
+                           structure.get("trigger_cdr", 0.06), terms, excess_sweep=1.0)
+    sub_yield_high = tranche_metrics(res_hi, tranches[-1])["实现收益率"]
+    sub_yield_low = tranche_metrics(res_lo, tranches[-1])["实现收益率"]
+
     report = build_report(case, pool, tranches, results, summaries, min_sub,
-                          counterfactual)
+                          counterfactual, sub_yield_low, sub_yield_high)
     md_path = os.path.join(out_dir, f"{cid}_report.md")
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(report)

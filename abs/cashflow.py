@@ -17,6 +17,33 @@
        到各月。目的是把"总量估得准不准"和"时间分布对不对"两个问题分开。
   3. 核销后回收按固定回收率、固定滞后处理，未刻画回收的时间分布。
   4. 循环期内假设购买率 100%、资产池余额严格维持不变（评级报告披露的量化参数假设）。
+
+## 月还款率的口径（第 3 周按《联合资信 消费金融类资产支持证券评级方法》修正）
+
+原实现按「当期余额 × 月还款率」逐月几何衰减，是错的。方法文件 p.5 的定义是：
+
+    月还款率 = 静态资产池当月收到的本金 / 静态资产池初始放款金额
+
+分母是**初始放款金额**，不是当期余额。所以正确的推演是每月本金回款额近似为常数
+`初始本金 × 月还款率`（受剩余余额封顶），而不是余额的等比衰减。
+
+这个差别很大：几何衰减下池子永远摊不完（前慢后快），水平偿还下约 1/月还款率 个月
+摊完（鼎柚 5.0 个月、够花 6.2 个月）。修正后模型的优先档清偿月才与披露的预期到期日
+对得上。
+
+## 累计违约率的分母（按两单说明书「累计违约率」定义修正）
+
+    A = 各收款期间内所有违约贷款在成为违约贷款时的未偿本金余额之和
+    B = 初始起算日资产池余额 + 各持续购买日购买的资产在持续购买基准日的未偿本金余额之和
+
+分母 B 要**加上历次持续购买的本金**，不是初始余额。循环购买结构下这个分母会快速膨胀，
+使累计违约率被显著稀释——这是循环结构里加速清偿不容易触发的机制性原因。
+本模块同时输出两个口径：`cum_charge_off_rate`（占初始余额）与
+`cum_default_rate`（占初始余额 + 累计购买本金），后者供触发判定使用。
+
+分子口径的一致性：方法文件 p.5 写明「逾期超过 30 天记为违约资产，逾期超过 90 天记为
+核销资产」，而两单说明书的「违约贷款」定义为逾期超过 90 日——**两者是同一批资产**。
+因此累计核销额可以直接作为累计违约率的分子，不需要再乘一个"违约→核销"的系数。
 """
 
 
@@ -33,13 +60,27 @@ def build_schedule(pool, co_mult=1.0, mrr_mult=1.0, recovery_mult=1.0, yield_mul
     rev = pool.revolving_months if revolving_cap is None else max(int(revolving_cap), 0)
 
     if vintage is not None:
+        # 两遍跑：先按恒定核销率得损失总量 L，再按曲线把 L 分发到各月。
+        # 但分发后余额轨迹变了，末期余额归零时 capping 会让实际总量偏离 L，
+        # 故做几次定点迭代：把上一轮实际总量与目标的比值作为修正系数重新分发。
+        # 修正到相对误差 < 1e-6 为止（通常 2–3 轮）。
         base = build_schedule(pool, co_mult, mrr_mult, recovery_mult, yield_mult,
                               revolving_cap=revolving_cap)
-        total_loss = sum(r["charge_off"] for r in base)
+        target = sum(r["charge_off"] for r in base)
         n = len(base)
-        amounts = vintage.allocate(n, total_loss,
+        amounts = vintage.allocate(n, target,
                                    revolving_months=rev,
                                    seasoning_months=pool.seasoning_months)
+        for _ in range(6):
+            got = sum(r["charge_off"] for r in _build(
+                pool, co_mult, mrr_mult, recovery_mult, yield_mult,
+                co_amounts=amounts, revolving_months=rev))
+            if got <= 0:
+                break
+            gap = target / got
+            if abs(gap - 1.0) < 1e-6:
+                break
+            amounts = [a * gap for a in amounts]
         return _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult,
                       co_amounts=amounts, revolving_months=rev)
 
@@ -65,10 +106,19 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None,
             return 0.0
         return min(co_amounts[m - 1], bal)
 
+    def principal_of(bal):
+        """第 m 月的本金回款额。
+
+        月还款率口径：当月收到本金 / 静态池**初始**放款金额，故回款额近似常数
+        `pool.balance * mrr`，以剩余余额封顶。原实现用 `bal * mrr`（几何衰减）是错的。
+        """
+        return min(pool.balance * mrr, bal)
+
     rows = []
     defaults = []
     bal = pool.balance
     cum_co = 0.0
+    cum_purchased = 0.0          # 持续购买累计本金，累计违约率分母的组成部分
     m = 1
 
     # ---------- 循环购买期 ----------
@@ -83,9 +133,10 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None,
             defaults.append((m, charge_off))
 
         # 本金回收（含核销）按购买率再投资，余额不变
-        principal_recovered = bal * mrr + charge_off
+        principal_recovered = principal_of(bal) + charge_off
         reinvested = principal_recovered * pool.reinvest_rate
         principal_to_trust = principal_recovered - reinvested
+        cum_purchased += reinvested
 
         rows.append({
             "month": m,
@@ -99,6 +150,8 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None,
             "total_collection": interest + principal_to_trust + recovery,
             "bal_end": bal - principal_to_trust - charge_off * (1 - pool.reinvest_rate),
             "cum_charge_off_rate": cum_co / pool.balance,
+            "cum_purchased": cum_purchased,
+            "cum_default_rate": cum_co / (pool.balance + cum_purchased),
         })
         bal = rows[-1]["bal_end"]
         if bal < 1.0:
@@ -109,7 +162,7 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None,
     end = rev + pool.amort_months + 2
     while bal > 1.0 and m <= end:
         interest = bal * rm
-        principal = bal * mrr
+        principal = principal_of(bal)
         charge_off = charge_off_of(m, bal)
         if principal + charge_off > bal:
             scale = bal / (principal + charge_off)
@@ -134,6 +187,8 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None,
             "total_collection": interest + principal + recovery,
             "bal_end": bal - principal - charge_off,
             "cum_charge_off_rate": cum_co / pool.balance,
+            "cum_purchased": cum_purchased,
+            "cum_default_rate": cum_co / (pool.balance + cum_purchased),
         })
         bal = rows[-1]["bal_end"]
         m += 1
@@ -154,6 +209,8 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None,
             "total_collection": recovery,
             "bal_end": 0.0,
             "cum_charge_off_rate": cum_co / pool.balance,
+            "cum_purchased": cum_purchased,
+            "cum_default_rate": cum_co / (pool.balance + cum_purchased),
         })
         m += 1
 
