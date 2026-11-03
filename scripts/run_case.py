@@ -180,14 +180,39 @@ def benchmark_section(case, pool, tranches, results, summaries):
         gap = (mine - theirs) / theirs * 100 if theirs else 0.0
         return [label, f"{mine:,.2f}", f"{theirs:,.2f}", f"{gap:+.1f}%"]
 
+    # 披露的「净损失」没有单列，但可以严格推出来：
+    #   净损失 = 累计投放本金（初始池 + 持续购买）− 回收款本金
+    # 两单都能还原到图表21 的内部勾稽上（鼎柚 351,992.59 − 299,285.89 = 52,706.70；
+    # 够花 172,743.88 − 131,640.92 = 41,102.96），因此可以作为对表基准。
+    disc_netloss = None
+    if disc.get("回收款本金") is not None and disc.get("持续购买支出") is not None:
+        disc_netloss = (wan(pool.balance) + disc["持续购买支出"]
+                        - disc["回收款本金"])
+
     L.append(md_table(["流入端项目（AAAsf）", "本模型", "评级机构披露", "偏差"], [
         cmp_row("回收款利息", interest, disc.get("回收款利息")),
         cmp_row("回收款本金", principal, disc.get("回收款本金")),
         cmp_row("持续购买支出", purchased, disc.get("持续购买支出")),
-        cmp_row("净损失（核销 − 回收）", netloss, None),
+        cmp_row("净损失（核销 − 回收）", netloss, disc_netloss),
         cmp_row("税费", tax, disc.get("税费")),
         ["累计放款 / 初始池", f"{(pool.balance + sum(r['purchase'] for r in rows)) / pool.balance:.2f}x", "—", "—"],
     ]))
+
+    # 修复前后的 GAP 对照：第 5 周把累计核销改成「总量锁定 + 时序分配」，
+    # 这张表的偏差会整体移动，甚至可能反向。把两列并排放，避免只报好的一面。
+    pre = bm.get("pre_fix_netloss_wan")
+    if pre and disc_netloss:
+        L.append("\n**第 5 周守恒修复对这张表的影响**：净损失由 {:,.2f} 万元变为 {:,.2f} 万元，"
+                 "对披露推算值 {:,.2f} 的偏差从 {:+.1f}% 变成 **{:+.1f}%**。{}"
+                 "修复前后的完整对照（含各档实付、极端净损失、反解厚度）见 "
+                 "`docs/loss-conservation.md` 第六节。".format(
+                     pre, netloss, disc_netloss,
+                     (pre - disc_netloss) / disc_netloss * 100,
+                     (netloss - disc_netloss) / disc_netloss * 100,
+                     "**方向反转**——旧模型约 22% 的守恒缺口把净损失系统性压低了，"
+                     "修复后缺口消失，偏差朝相反方向露出。" if
+                     (pre - disc_netloss) * (netloss - disc_netloss) < 0 else
+                     "偏差收窄，但仍有缺口。"))
 
     # 现金守恒上限：购买率开到 100%，看披露参数下最多能买多少。
     # 若连上限都低于披露值，说明披露的持续购买额不可能由公开参数推出，
