@@ -21,26 +21,35 @@
 
 
 def build_schedule(pool, co_mult=1.0, mrr_mult=1.0, recovery_mult=1.0, yield_mult=1.0,
-                   vintage=None):
+                   vintage=None, revolving_cap=None):
     """返回月度明细列表。mult 参数用于压力情景。
 
     vintage 不为 None 时启用账龄曲线：先按恒定核销率跑一遍得到损失总量与期限，
     再按曲线把同样的总量重新分配到各月。两遍结果的总核销量一致，差异纯粹来自时序。
+
+    revolving_cap 用于模拟「加速清偿 → 停止持续购买 → 提前进入摊还期」：
+    给出则覆盖 pool.revolving_months 作为循环期的实际上限。
     """
+    rev = pool.revolving_months if revolving_cap is None else max(int(revolving_cap), 0)
+
     if vintage is not None:
-        base = build_schedule(pool, co_mult, mrr_mult, recovery_mult, yield_mult)
+        base = build_schedule(pool, co_mult, mrr_mult, recovery_mult, yield_mult,
+                              revolving_cap=revolving_cap)
         total_loss = sum(r["charge_off"] for r in base)
         n = len(base)
         amounts = vintage.allocate(n, total_loss,
-                                   revolving_months=pool.revolving_months,
+                                   revolving_months=rev,
                                    seasoning_months=pool.seasoning_months)
         return _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult,
-                      co_amounts=amounts)
+                      co_amounts=amounts, revolving_months=rev)
 
-    return _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult)
+    return _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult,
+                  revolving_months=rev)
 
 
-def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None):
+def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None,
+           revolving_months=None):
+    rev = pool.revolving_months if revolving_months is None else int(revolving_months)
     rm = pool.monthly_rate() * yield_mult
     mrr = min(max(pool.monthly_repayment_rate * mrr_mult, 0.001), 0.95)
     co_rate = min(pool.charge_off_rate * co_mult, 0.95)
@@ -63,7 +72,7 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None):
     m = 1
 
     # ---------- 循环购买期 ----------
-    while m <= pool.revolving_months and bal > 1.0:
+    while m <= rev and bal > 1.0:
         interest = bal * rm
         charge_off = charge_off_of(m, bal)
         recovery = sum(a for (mm, a) in defaults if m - mm == lag) * rec_rate
@@ -97,7 +106,7 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None):
         m += 1
 
     # ---------- 摊还期 ----------
-    end = pool.revolving_months + pool.amort_months + 2
+    end = rev + pool.amort_months + 2
     while bal > 1.0 and m <= end:
         interest = bal * rm
         principal = bal * mrr

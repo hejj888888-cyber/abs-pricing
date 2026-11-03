@@ -24,7 +24,7 @@ def _build(template_tranches, sub_share):
 
 
 def min_subordination(rows, pool_balance, template_tranches, pay_mode="sequential",
-                      trigger_cdr=0.06, lo=0.005, hi=0.45, tol=0.0025):
+                      trigger_cdr=0.06, lo=0.005, hi=0.45, tol=0.0025, terms=None):
     """二分求最小次级厚度。返回 (最小厚度, 搜索轨迹)。"""
     senior_names = [t.name for t in template_tranches[:-1]]
     trace = []
@@ -33,7 +33,7 @@ def min_subordination(rows, pool_balance, template_tranches, pay_mode="sequentia
         if 1.0 - s - sum(t.share for t in template_tranches[1:-1]) <= 0:
             return False
         trs = _build(template_tranches, s)
-        res = run_waterfall(rows, pool_balance, trs, pay_mode, trigger_cdr)
+        res = run_waterfall(rows, pool_balance, trs, pay_mode, trigger_cdr, terms)
         ok = all(res.unpaid_principal[n] <= 1.0 for n in senior_names)
         trace.append((s, ok))
         return ok

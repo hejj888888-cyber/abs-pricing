@@ -38,7 +38,8 @@ def irr(monthly_cfs, notional):
     return (lo + hi) / 2.0
 
 
-def solve_coupons(rows, pool_balance, tranches, pay_mode="sequential", trigger_cdr=0.06):
+def solve_coupons(rows, pool_balance, tranches, pay_mode="sequential", trigger_cdr=0.06,
+                  terms=None):
     """逐档反解票面利率：让该档在面值发行下达到目标收益率。"""
     from .waterfall import run_waterfall
 
@@ -53,7 +54,7 @@ def solve_coupons(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
         for _ in range(60):
             mid = (lo + hi) / 2.0
             t.coupon = mid
-            res = run_waterfall(rows, pool_balance, tranches, pay_mode, trigger_cdr)
+            res = run_waterfall(rows, pool_balance, tranches, pay_mode, trigger_cdr, terms)
             y = irr(res.cashflow[t.name], res.notional[t.name])
             if y is None or y < t.target_yield:
                 lo = mid

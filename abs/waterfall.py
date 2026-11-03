@@ -4,10 +4,23 @@
 
 三个真实结构里必须刻画的细节：
   1. 顺序偿付（sequential）：所有本金先还优先A，A 清零后才轮到下一档。
-  2. 加速清偿触发：累计核销率突破阈值即提前转为顺序偿付。
+  2. 加速清偿触发：累计违约率突破阈值即提前转为顺序偿付。
   3. 次级期间收益封顶：真实交易（如鼎柚2025三期）约定次级在优先档清偿完毕前
      按不超过 3%/年获得期间收益，超额部分留在信托里，到最后才释放。
      不做这条约束，次级收益率会被算到 50% 以上，与市场不符。
+
+## 循环购买期不分配本金（第 3 周修正）
+
+早期版本在循环期也执行本金分配，把「利息收入 − 服务费 − 各档利息」的余额
+当成本金付给了优先A。这是个实质性错误：循环期内本金回收款按购买率全额再投资，
+资产池余额不变（见 cashflow.py），此时若再拿收入分账的剩余去还本，等于把
+超额利差当作本金支付，凭空缩短优先档期限。
+
+真实结构中，循环期的收入分账剩余有两个去向：
+  a) 转入本金分账，用于支付持续购买的价款（即资产池实际规模大于初始规模）；
+  b) 留存在信托账户，摊还期用于补足利息缺口，期末释放给次级。
+本模型采用 (b)：循环期只付息，剩余留存在 `reserve`；摊还期 `reserve` 优先用于
+补足优先档利息缺口（避免把「账上有钱却欠息」算成违约事件），期末余额释放给次级。
 """
 
 from dataclasses import dataclass, field
@@ -23,6 +36,7 @@ class Tranche:
     coupon: float = 0.0
     reference_yield: float = 0.015
     income_rate: float = 0.0        # residual 档期间收益率上限（年化），0 表示不分期间收益
+    expected_maturity_month: int = 0  # 预期到期月（1 起，0 表示不适用）
 
     @classmethod
     def from_dict(cls, d):
@@ -35,6 +49,7 @@ class Tranche:
             coupon=float(d.get("coupon", 0.0)),
             reference_yield=float(d.get("reference_yield", 0.015)),
             income_rate=float(d.get("income_rate", 0.0)),
+            expected_maturity_month=int(d.get("expected_maturity_month", 0)),
         )
 
 
@@ -47,9 +62,19 @@ class WaterfallResult:
     unpaid_interest: dict = field(default_factory=dict)
     accel_month: int = 0
     reserve: float = 0.0                              # 期末释放给次级的留存超额收益
+    excess_servicing: float = 0.0                     # 归服务商的超额服务费（excess_sweep=True 时）
+    trigger_events: list = field(default_factory=list)  # 触发事件明细（第 3 周新增）
 
 
-def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_cdr=0.06):
+def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_cdr=0.06,
+                  terms=None, pre_fired=None, excess_sweep=False):
+    """terms 不为 None 时启用多条件触发；否则退回单一累计核销率阈值。
+
+    pre_fired   已判定触发的条件代号集合。加速清偿一旦发生不可逆，重跑时不能再
+                把同一个条件当成"新事件"记录，故由调用方传进来。
+    excess_sweep True 表示收入分账剩余作为超额服务费归服务商（说明书通常不披露该费率，
+                因其按剩余金额结算）。默认 False，即剩余全部归次级。
+    """
     names = [t.name for t in tranches]
     notional = {t.name: t.share * pool_balance for t in tranches}
     balances = dict(notional)
@@ -57,9 +82,12 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
     pr = {n: [] for n in names}
     unpaid_in = {n: 0.0 for n in names}
     reserve = 0.0
+    excess_servicing = 0.0
     accel_month = 0
     res = tranches[-1]
     res_income = (res.income_rate * notional[res.name] / 12.0) if res.income_rate else 0.0
+    events = []
+    fired = set(pre_fired or ())
 
     for row in rows:
         avail = row["total_collection"] - row["servicing_fee"]
@@ -69,7 +97,16 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
         for n in names:
             pr[n].append(0.0)
 
-        # 1) 利息
+        # 1) 利息。先算出当期应付总额，不足时动用留存超额收益补足，
+        #    避免"账上有钱却欠息"被误判为优先档利息未足额偿付。
+        payable = [(t, t.coupon * balances[t.name] / 12.0)
+                   for t in tranches if t.mode != "residual"]
+        total_due = sum(d for _, d in payable)
+        if avail < total_due and reserve > 0:
+            draw = min(reserve, total_due - avail)
+            avail += draw
+            reserve -= draw
+
         for t in tranches:
             if t.mode == "residual":
                 cf[t.name].append(0.0)
@@ -80,13 +117,36 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
             unpaid_in[t.name] += due - pay
             cf[t.name].append(pay)
 
-        # 2) 触发
-        accelerated = accel_month != 0 or row["cum_charge_off_rate"] > trigger_cdr
-        if accelerated and accel_month == 0:
+        # 2) 触发判定
+        if terms is not None:
+            from .trigger import evaluate_month
+
+            if terms.principal_overdue_enabled:
+                overdue = [t.name for t in tranches
+                           if t.mode != "residual" and t.expected_maturity_month
+                           and row["month"] > t.expected_maturity_month
+                           and balances[t.name] > 1.0]
+            else:
+                overdue = []   # 见 trigger.py 模块说明：模型摊还偏差会误报
+            senior_unpaid = {t.name: unpaid_in[t.name] for t in tranches
+                             if t.mode != "residual"}
+            new_events = evaluate_month(row["month"], row["cum_charge_off_rate"],
+                                        senior_unpaid, overdue, terms, fired)
+            if new_events:
+                events.extend(new_events)
+                # 只有加速清偿事件会终止持续购买；违约事件的后果是证券提前到期，
+                # 不改变循环期长度。见 trigger.py「加速清偿事件 ≠ 违约事件」。
+                if accel_month == 0 and any(e.kind == "accel" for e in new_events):
+                    accel_month = row["month"]
+        elif accel_month == 0 and row["cum_charge_off_rate"] > trigger_cdr:
             accel_month = row["month"]
 
-        # 3) 本金
-        if pay_mode == "sequential" or accelerated:
+        accelerated = accel_month != 0
+
+        # 3) 本金。循环购买期不分配本金（见模块顶部说明）。
+        if row["phase"] == "revolving":
+            pass
+        elif pay_mode == "sequential" or accelerated:
             for t in tranches:
                 principal = min(avail, balances[t.name])
                 if principal > 0:
@@ -105,13 +165,16 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
                     cf[t.name][-1] += principal
                     pr[t.name][-1] += principal
 
-        # 4) 剩余：次级期间收益封顶，超额留存
+        # 4) 剩余：次级期间收益封顶，超额留存或归服务商
         if avail > 1e-9:
             if res_income > 0:
                 pay = min(res_income, avail)
                 cf[res.name][-1] += pay
                 avail -= pay
-            reserve += avail
+            if excess_sweep:
+                excess_servicing += avail
+            else:
+                reserve += avail
 
     if reserve > 0 and cf[res.name]:
         cf[res.name][-1] += reserve
@@ -124,4 +187,6 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
         unpaid_interest=unpaid_in,
         accel_month=accel_month,
         reserve=reserve,
+        excess_servicing=excess_servicing,
+        trigger_events=events,
     )

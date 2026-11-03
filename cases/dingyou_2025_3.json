@@ -22,7 +22,19 @@
   "structure": {
     "pay_mode": "sequential",
     "trigger_cdr": 0.05,
-    "trigger_note": "原件触发指标为【累计违约率】：信托生效日起一年内（含）超过 5%，满一年后超过 8%。本引擎只有累计核销率指标，无法直接比较——核销滞后于违约，故 trigger_cdr=5% 近似会偏晚触发。真实多条件触发为第 4 周任务。"
+    "trigger_note": "已改用 triggers 多条件触发；trigger_cdr 仅在 triggers 缺失时作为旧逻辑兜底。"
+  },
+  "triggers": {
+    "enabled": true,
+    "cdr_first_year": 0.05,
+    "cdr_after_first_year": 0.08,
+    "first_year_months": 12,
+    "default_uplift": 1.0,
+    "default_uplift_note": "累计违约率 = 累计核销率 × 该系数。违约在前、核销在后，真实违约率高于同期核销率，取 1.0 等于忽略该差，触发会偏晚；该系数无实证支撑，属显式假设。",
+    "flags": {},
+    "source": "发行说明书（129）条加速清偿事件、（130）条违约事件、（131）条权利完善事件",
+    "principal_overdue_enabled": false,
+    "principal_overdue_note": "「优先档本金未按期足额分配」实现但默认关闭：模型摊还按「余额×月还款率」几何衰减，比披露的优先档预期到期日慢 2–3 个月（见报告对账表），用模型口径判会把口径差误报成违约事件。"
   },
   "vintage": {
     "enabled": true,
@@ -37,7 +49,8 @@
       "rating": "AAA",
       "mode": "fixed",
       "coupon": 0.0185,
-      "reference_yield": 0.015
+      "reference_yield": 0.015,
+      "expected_maturity_month": 12
     },
     {
       "name": "优先B",
@@ -45,7 +58,8 @@
       "rating": "AA+",
       "mode": "fixed",
       "coupon": 0.022,
-      "reference_yield": 0.015
+      "reference_yield": 0.015,
+      "expected_maturity_month": 13
     },
     {
       "name": "优先C",
@@ -53,7 +67,8 @@
       "rating": "A+",
       "mode": "fixed",
       "coupon": 0.0275,
-      "reference_yield": 0.015
+      "reference_yield": 0.015,
+      "expected_maturity_month": 14
     },
     {
       "name": "次级",
@@ -61,7 +76,8 @@
       "rating": "未评级",
       "mode": "residual",
       "reference_yield": 0.015,
-      "income_rate": 0.03
+      "income_rate": 0.03,
+      "expected_maturity_month": 21
     }
   ],
   "computed": {
@@ -73,11 +89,29 @@
     "oc_rate": 0.002122
   },
   "disclosed": {
-    "tranche_size_wan": {"优先A": 111900, "优先B": 8700, "优先C": 15500, "次级": 13900},
-    "tranche_pct_of_securities": {"优先A": 0.746, "优先B": 0.058, "优先C": 0.1033, "次级": 0.0927},
-    "coupon": {"优先A": 0.0185, "优先B": 0.022, "优先C": 0.0275, "次级": null},
+    "tranche_size_wan": {
+      "优先A": 111900,
+      "优先B": 8700,
+      "优先C": 15500,
+      "次级": 13900
+    },
+    "tranche_pct_of_securities": {
+      "优先A": 0.746,
+      "优先B": 0.058,
+      "优先C": 0.1033,
+      "次级": 0.0927
+    },
+    "coupon": {
+      "优先A": 0.0185,
+      "优先B": 0.022,
+      "优先C": 0.0275,
+      "次级": null
+    },
     "expected_maturity": {
-      "优先A": "2026-06-26", "优先B": "2026-07-26", "优先C": "2026-08-26", "次级": "2027-03-26"
+      "优先A": "2026-06-26",
+      "优先B": "2026-07-26",
+      "优先C": "2026-08-26",
+      "次级": "2027-03-26"
     },
     "legal_maturity": "2030-03-26",
     "trust_effective_date": "2025-06-26",
@@ -120,16 +154,46 @@
     "优先C": 0.0927
   },
   "param_sources": {
-    "balance": ["披露", "初始资产池未偿本金 150,318.94 万元（含超额抵押 318.94 万元）"],
-    "annual_yield": ["披露", "加权平均现行贷款年利率 21.15%"],
-    "charge_off_rate": ["披露", "量化参数·核销率 3.14%（历史静态池平均）"],
-    "monthly_repayment_rate": ["披露", "量化参数·月还款率 19.87%"],
-    "reinvest_rate": ["披露", "量化参数·购买率 100%"],
-    "recovery_rate": ["披露", "中债资信《表15》基准条件 3.31%；加压幅度下降 10%/20%/降至 0"],
-    "recovery_lag_months": ["披露", "中债资信《表15》「回收周期(月)」= 6。原件无「回收滞后」一词，模型按回收周期映射"],
-    "revolving_months": ["披露", "发行说明书「持续购买终止日」= 信托成立后届满 8 个月所在月最后一日（2025-06-26 → 2026-02-28）"],
-    "amort_months": ["披露", "持续购买终止日 2026-02-28 至次级预期到期日 2027-03-26，约 13 个月"],
-    "servicing_fee_rate": ["假设", "说明书《主定义表》(152)(153) 仅规定前端/后端服务报酬「由收费文件约定」，未载明费率、计费基数与周期。0.5%/年无文件依据，属模型假设"]
+    "balance": [
+      "披露",
+      "初始资产池未偿本金 150,318.94 万元（含超额抵押 318.94 万元）"
+    ],
+    "annual_yield": [
+      "披露",
+      "加权平均现行贷款年利率 21.15%"
+    ],
+    "charge_off_rate": [
+      "披露",
+      "量化参数·核销率 3.14%（历史静态池平均）"
+    ],
+    "monthly_repayment_rate": [
+      "披露",
+      "量化参数·月还款率 19.87%"
+    ],
+    "reinvest_rate": [
+      "披露",
+      "量化参数·购买率 100%"
+    ],
+    "recovery_rate": [
+      "披露",
+      "中债资信《表15》基准条件 3.31%；加压幅度下降 10%/20%/降至 0"
+    ],
+    "recovery_lag_months": [
+      "披露",
+      "中债资信《表15》「回收周期(月)」= 6。原件无「回收滞后」一词，模型按回收周期映射"
+    ],
+    "revolving_months": [
+      "披露",
+      "发行说明书「持续购买终止日」= 信托成立后届满 8 个月所在月最后一日（2025-06-26 → 2026-02-28）"
+    ],
+    "amort_months": [
+      "披露",
+      "持续购买终止日 2026-02-28 至次级预期到期日 2027-03-26，约 13 个月"
+    ],
+    "servicing_fee_rate": [
+      "假设",
+      "说明书《主定义表》(152)(153) 仅规定前端/后端服务报酬「由收费文件约定」，未载明费率、计费基数与周期。0.5%/年无文件依据，属模型假设"
+    ]
   },
   "tranche_sources": "分层规模/占比/票面/到期日均取自发行说明书与簿记建档发行结果公告；share 已按 证券总额÷资产池 = 99.7879% 折算为占资产池比例"
 }
