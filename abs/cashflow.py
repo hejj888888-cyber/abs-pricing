@@ -11,20 +11,50 @@
 
 口径说明：
   1. 利息按月初余额计。
-  2. 核销按年化核销率折算为月度核销率，逐月按余额计提。
+  2. 核销有两种模式：
+     - 恒定模式（默认）：年化核销率折算为月度核销率，逐月按余额计提。
+     - 账龄曲线模式（vintage）：保持核销总量不变，按 Weibull 累计曲线重新分配
+       到各月。目的是把"总量估得准不准"和"时间分布对不对"两个问题分开。
   3. 核销后回收按固定回收率、固定滞后处理，未刻画回收的时间分布。
   4. 循环期内假设购买率 100%、资产池余额严格维持不变（评级报告披露的量化参数假设）。
 """
 
 
-def build_schedule(pool, co_mult=1.0, mrr_mult=1.0, recovery_mult=1.0, yield_mult=1.0):
-    """返回月度明细列表。mult 参数用于压力情景。"""
+def build_schedule(pool, co_mult=1.0, mrr_mult=1.0, recovery_mult=1.0, yield_mult=1.0,
+                   vintage=None):
+    """返回月度明细列表。mult 参数用于压力情景。
+
+    vintage 不为 None 时启用账龄曲线：先按恒定核销率跑一遍得到损失总量与期限，
+    再按曲线把同样的总量重新分配到各月。两遍结果的总核销量一致，差异纯粹来自时序。
+    """
+    if vintage is not None:
+        base = build_schedule(pool, co_mult, mrr_mult, recovery_mult, yield_mult)
+        total_loss = sum(r["charge_off"] for r in base)
+        n = len(base)
+        amounts = vintage.allocate(n, total_loss,
+                                   revolving_months=pool.revolving_months,
+                                   seasoning_months=pool.seasoning_months)
+        return _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult,
+                      co_amounts=amounts)
+
+    return _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult)
+
+
+def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None):
     rm = pool.monthly_rate() * yield_mult
     mrr = min(max(pool.monthly_repayment_rate * mrr_mult, 0.001), 0.95)
     co_rate = min(pool.charge_off_rate * co_mult, 0.95)
     mdr = 1 - (1 - co_rate) ** (1.0 / 12)
     rec_rate = min(pool.recovery_rate * recovery_mult, 1.0)
     lag = pool.recovery_lag_months
+
+    def charge_off_of(m, bal):
+        """第 m 月的核销量。曲线模式下取预算额度，且不超过当期余额。"""
+        if co_amounts is None:
+            return bal * mdr
+        if m - 1 >= len(co_amounts):
+            return 0.0
+        return min(co_amounts[m - 1], bal)
 
     rows = []
     defaults = []
@@ -35,7 +65,7 @@ def build_schedule(pool, co_mult=1.0, mrr_mult=1.0, recovery_mult=1.0, yield_mul
     # ---------- 循环购买期 ----------
     while m <= pool.revolving_months and bal > 1.0:
         interest = bal * rm
-        charge_off = bal * mdr
+        charge_off = charge_off_of(m, bal)
         recovery = sum(a for (mm, a) in defaults if m - mm == lag) * rec_rate
         fee = bal * pool.servicing_fee_rate / 12.0
 
@@ -71,7 +101,7 @@ def build_schedule(pool, co_mult=1.0, mrr_mult=1.0, recovery_mult=1.0, yield_mul
     while bal > 1.0 and m <= end:
         interest = bal * rm
         principal = bal * mrr
-        charge_off = bal * mdr
+        charge_off = charge_off_of(m, bal)
         if principal + charge_off > bal:
             scale = bal / (principal + charge_off)
             principal *= scale

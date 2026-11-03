@@ -1,10 +1,10 @@
 {
   "case_name": "够花2025年第二期个人消费贷款资产支持证券（海尔消金）",
   "case_id": "gouhua-2025-2",
-  "data_status": "真实披露参数",
+  "data_status": "真实披露参数（票面为发行结果实际值，不再反解）",
   "source": {
-    "name": "联合资信《够花2025年第二期个人消费贷款资产支持证券信用评级报告》（2025-06）",
-    "url": "https://www.lhratings.com/reports/A003638-P80879-2025.pdf"
+    "name": "中债资信评估有限责任公司《够花2025年第二期个人消费贷款资产支持证券信用评级报告》",
+    "url": "https://www.chinamoney.com.cn/dqs/cm-s-notice-query/fileDownLoad.do?contentId=3141326&mode=save&priority=0"
   },
   "pool": {
     "balance": 1500000000,
@@ -14,30 +14,37 @@
     "recovery_rate": 0.0278,
     "recovery_lag_months": 6,
     "servicing_fee_rate": 0.005,
-    "revolving_months": 6,
-    "amort_months": 12,
+    "revolving_months": 7,
+    "amort_months": 37,
     "reinvest_rate": 1.0,
     "seasoning_months": 1
   },
   "structure": {
     "pay_mode": "sequential",
-    "trigger_cdr": 0.06
+    "trigger_cdr": 0.05,
+    "trigger_note": "原件触发指标为【累计违约率】：信托设立日起第一年度超过 5%，第二年及以后超过 10%。本引擎只有累计核销率指标，无法直接比较——核销滞后于违约，故用 trigger_cdr=5% 近似会偏晚触发。真实多条件触发为第 4 周任务。"
+  },
+  "vintage": {
+    "enabled": true,
+    "tau": 8.0,
+    "shape": 2.0,
+    "calibration": "累计违约率曲线形态取自评级报告 p.13「静态样本池累计违约率」（67 个静态池）；报告正文给出可引用锚点：本期静态样本池推出的累计违约率均值为 3.46%。曲线仅重整时序，不改变损失总量。"
   },
   "tranches": [
     {
       "name": "优先A",
       "share": 0.712,
       "rating": "AAA",
-      "mode": "solve",
-      "target_yield": 0.018,
+      "mode": "fixed",
+      "coupon": 0.018,
       "reference_yield": 0.015
     },
     {
       "name": "优先B",
       "share": 0.0827,
       "rating": "AAA",
-      "mode": "solve",
-      "target_yield": 0.0195,
+      "mode": "fixed",
+      "coupon": 0.0195,
       "reference_yield": 0.015
     },
     {
@@ -45,14 +52,35 @@
       "share": 0.2053,
       "rating": "未评级",
       "mode": "residual",
-      "reference_yield": 0.015
+      "reference_yield": 0.015,
+      "income_rate": 0.03
     }
   ],
+  "computed": {
+    "note": "本单无超额抵押：资产池 150,000.00 万元 = 证券 150,000 万元，故披露占比即占资产池比例。",
+    "securities_total": 1500000000,
+    "pool_balance": 1500000000,
+    "ratio_securities_to_pool": 1.0,
+    "overcollateralization": 0,
+    "oc_rate": 0.0
+  },
+  "disclosed": {
+    "tranche_size_wan": {"优先A": 106800, "优先B": 12400, "次级": 30800},
+    "tranche_pct_of_securities": {"优先A": 0.712, "优先B": 0.0827, "次级": 0.2053},
+    "coupon": {"优先A": 0.018, "优先B": 0.0195, "次级": null},
+    "expected_maturity": {"优先A": "2026-06-26", "优先B": "2026-07-26", "次级": "2029-02-26"},
+    "legal_maturity": "2032-02-26",
+    "trust_establish_date": "2025-07-08",
+    "revolving_end_date": "2026-01-31",
+    "sub_issue_price": 102,
+    "static_pool_cum_default_mean": 0.0346,
+    "liquidity_reserve": "第一个收款期间结束后开始按限额归集；贷款服务机构满足必备评级时限额为零"
+  },
   "scenarios": [
     {
       "id": "base",
       "label": "基准情景",
-      "note": "披露值：核销率 4.41%、月还款率 16.23%、购买率 100%",
+      "note": "披露值：核销率 4.41%、月还款率 16.23%、购买率 100%、回收率 2.78%",
       "co_mult": 1.0,
       "mrr_mult": 1.0,
       "recovery_mult": 1.0,
@@ -82,56 +110,16 @@
     "优先B": 0.2053
   },
   "param_sources": {
-    "balance": [
-      "披露",
-      "初始资产池未偿本金 150,000.00 万元"
-    ],
-    "annual_yield": [
-      "披露",
-      "加权平均年利率 23.57%"
-    ],
-    "charge_off_rate": [
-      "披露",
-      "量化参数·核销率 4.41%（历史静态池平均）"
-    ],
-    "monthly_repayment_rate": [
-      "披露",
-      "量化参数·月还款率 16.23%"
-    ],
-    "reinvest_rate": [
-      "披露",
-      "量化参数·购买率 100%"
-    ],
-    "recovery_rate": [
-      "披露",
-      "中债资信《表15：压力测试的基准条件和加压幅度》基准条件 2.78%；加压幅度为下降 10%/20%/降至 0"
-    ],
-    "recovery_lag_months": [
-      "披露",
-      "中债资信《表15》基准条件「回收周期(月)」= 6。原件未使用「回收滞后」一词，本模型按回收周期 6 个月处理"
-    ],
-    "servicing_fee_rate": [
-      "假设",
-      "说明书「参与机构」章节未摘录到具体费率，按 0.5%/年假设"
-    ],
-    "revolving_months": [
-      "披露",
-      "发行说明书「持续购买」期限 6 个月（原件用「持续购买」，非「循环购买」）"
-    ],
-    "amort_months": [
-      "假设",
-      "摊还期上限按 12 个月（说明书有摊还期章节，具体月数待补录）"
-    ]
+    "balance": ["披露", "初始资产池未偿本金 150,000.00 万元，无超额抵押"],
+    "annual_yield": ["披露", "加权平均年利率 23.57%"],
+    "charge_off_rate": ["披露", "量化参数·核销率 4.41%（历史静态池平均）"],
+    "monthly_repayment_rate": ["披露", "量化参数·月还款率 16.23%"],
+    "reinvest_rate": ["披露", "量化参数·购买率 100%"],
+    "recovery_rate": ["披露", "中债资信《表15》基准条件 2.78%；加压幅度下降 10%/20%/降至 0"],
+    "recovery_lag_months": ["披露", "中债资信《表15》「回收周期(月)」= 6。原件无「回收滞后」一词，模型按回收周期映射"],
+    "revolving_months": ["披露", "发行说明书「持续购买终止日」= 2026-01-31，信托设立日 2025-07-08，折约 7 个月"],
+    "amort_months": ["披露", "持续购买终止日 2026-01-31 至次级预期到期日 2029-02-26，约 37 个月"],
+    "servicing_fee_rate": ["假设", "说明书仅规定服务报酬依《服务合同》/收费文件约定，未载明费率、计费基数与周期。0.5%/年无文件依据，属模型假设"]
   },
-  "additional_sources": [
-    {
-      "name": "中债资信评估有限责任公司《够花2025年第二期个人消费贷款资产支持证券信用评级报告》",
-      "used_for": "表15 压力测试基准条件（回收率 2.78%、回收周期 6 个月）；静态样本池累计违约率"
-    },
-    {
-      "name": "建信信托有限责任公司《够花2025年第二期个人消费贷款资产支持证券发行说明书》",
-      "used_for": "持续购买期限 6 个月、摊还期、加速清偿事件、收益账/本金账分配顺序"
-    }
-  ],
-  "tranche_sources": "分层占比取自评级报告交易概览表；优先A/B 票面取发行结果公告（1.80% / 1.95%）"
+  "tranche_sources": "分层规模/占比/票面/到期日取自发行说明书与发行结果公告；本单无超额抵押，披露占比可直接用作占资产池比例"
 }

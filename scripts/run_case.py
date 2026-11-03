@@ -16,6 +16,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from abs import Pool, build_schedule, Tranche, run_waterfall, solve_coupons, tranche_metrics
+from abs.vintage import VintageCurve, from_dict as vintage_from_dict
 from abs.cashflow import summarize_pool
 from abs.structure import min_subordination
 
@@ -37,13 +38,14 @@ def pct(x, nd=2):
     return "—" if x is None else f"{x * 100:.{nd}f}%"
 
 
-def run_scenario(pool, tranches, structure, sc):
+def run_scenario(pool, tranches, structure, sc, vintage=None):
     rows = build_schedule(
         pool,
         co_mult=sc.get("co_mult", 1.0),
         mrr_mult=sc.get("mrr_mult", 1.0),
         recovery_mult=sc.get("recovery_mult", 1.0),
         yield_mult=sc.get("yield_mult", 1.0),
+        vintage=vintage,
     )
     result = run_waterfall(
         rows, pool.balance, tranches,
@@ -133,6 +135,23 @@ def build_report(case, pool, tranches, results, summaries, min_sub):
     n_disc = sum(1 for v in ps.values() if v[0] == "披露")
     L.append("> 披露参数 {} 项，假设参数 {} 项。假设项的影响在第八节说明。\n".format(
         n_disc, len(ps) - n_disc))
+
+    v = case.get("vintage")
+    if v and v.get("enabled"):
+        vc = VintageCurve(tau=float(v.get("tau", 8.0)), shape=float(v.get("shape", 2.0)))
+        s = vc.summary()
+        L.append("\n### 账龄损失曲线（第 2 周新增）\n")
+        L.append("核销率不再按月恒定计提，改用 Weibull 累计曲线重整时序："
+                 "`S(t) = 1 - exp(-(t/tau)^k)`，取 tau = {} 月、k = {}，"
+                 "边际违约率在第 {} 月见顶。\n".format(s["tau(月)"], s["shape"], s["边际峰值月"]))
+        curve_rows = [[f"{t} 月", pct(vc.cum(t), 1), pct(vc.marginal(t), 2)]
+                      for t in (1, 3, 6, 9, 12, 15, 18, 24)]
+        L.append(md_table(["账龄", "累计违约率（占平台）", "边际违约率（占平台）"], curve_rows))
+        L.append("\n> **关键设计**：曲线只重整时间分布，不改变损失总量——总量仍等于恒定模式"
+                 "算出的累计核销额。这样结果差异纯粹来自时序效应，不会与「总量估错」混在一起。\n")
+        L.append("> **口径提醒**：评级报告的累计违约率是**单只静态池**口径，本模型算的是**循环购买池**"
+                 "的累计核销率。循环期内本金被反复投放，同一笔钱可能多次暴露于违约，"
+                 "故循环池的累计核销率相对初始余额可以高于单池累计违约率，两者不可直接比较。\n")
 
     L.append("## 二、情景设置与资产池结果\n")
     rows = []
@@ -224,14 +243,15 @@ def run_one(case_path, out_dir, quiet=False):
     tranches = [Tranche.from_dict(t) for t in case["tranches"]]
     structure = case.get("structure", {})
     scenarios = case["scenarios"]
+    vintage = vintage_from_dict(case.get("vintage"))
 
-    rows0 = build_schedule(pool)
+    rows0 = build_schedule(pool, vintage=vintage)
     solve_coupons(rows0, pool.balance, tranches, structure.get("pay_mode", "sequential"),
                   structure.get("trigger_cdr", 0.06))
 
     results, summaries = [], []
     for s in scenarios:
-        r = run_scenario(pool, tranches, structure, s)
+        r = run_scenario(pool, tranches, structure, s, vintage)
         ok, gap = check_conservation(r[0], r[1])
         results.append(r)
         summaries.append(summarize_pool(r[0], pool))

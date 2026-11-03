@@ -1,10 +1,10 @@
 {
   "case_name": "鼎柚2025年第三期个人消费贷款资产支持证券（中原消金）",
   "case_id": "dingyou-2025-3",
-  "data_status": "真实披露参数",
+  "data_status": "真实披露参数（票面为发行结果实际值，不再反解）",
   "source": {
-    "name": "联合资信《鼎柚2025年第三期个人消费贷款资产支持证券信用评级报告》（联合〔2025〕3397号，2025-05-23）",
-    "url": "https://www.lhratings.com/reports/A014622-P80573-2025.pdf"
+    "name": "中债资信评估有限责任公司《鼎柚2025年第三期个人消费贷款资产支持证券信用评级报告》",
+    "url": "https://www.chinamoney.com.cn/dqs/cm-s-notice-query/fileDownLoad.do?contentId=3132510&mode=save&priority=0"
   },
   "pool": {
     "balance": 1503189400,
@@ -15,53 +15,81 @@
     "recovery_lag_months": 6,
     "servicing_fee_rate": 0.005,
     "revolving_months": 8,
-    "amort_months": 12,
+    "amort_months": 13,
     "reinvest_rate": 1.0,
     "seasoning_months": 5
   },
   "structure": {
     "pay_mode": "sequential",
-    "trigger_cdr": 0.06
+    "trigger_cdr": 0.05,
+    "trigger_note": "原件触发指标为【累计违约率】：信托生效日起一年内（含）超过 5%，满一年后超过 8%。本引擎只有累计核销率指标，无法直接比较——核销滞后于违约，故 trigger_cdr=5% 近似会偏晚触发。真实多条件触发为第 4 周任务。"
+  },
+  "vintage": {
+    "enabled": true,
+    "tau": 8.0,
+    "shape": 2.0,
+    "calibration": "累计违约率曲线形态取自评级报告 p.13「静态样本池累计违约率」（68 个静态池）：账龄 6 月约达平台 40–60%、12 月 85–95%、15–18 月收敛，无下降段。曲线仅重整时序，不改变损失总量。"
   },
   "tranches": [
     {
       "name": "优先A",
-      "share": 0.7444,
+      "share": 0.744418,
       "rating": "AAA",
-      "mode": "solve",
-      "target_yield": 0.0205,
+      "mode": "fixed",
+      "coupon": 0.0185,
       "reference_yield": 0.015
     },
     {
       "name": "优先B",
-      "share": 0.0579,
+      "share": 0.057877,
       "rating": "AA+",
-      "mode": "solve",
-      "target_yield": 0.023,
+      "mode": "fixed",
+      "coupon": 0.022,
       "reference_yield": 0.015
     },
     {
       "name": "优先C",
-      "share": 0.1031,
+      "share": 0.103081,
       "rating": "A+",
-      "mode": "solve",
-      "target_yield": 0.045,
+      "mode": "fixed",
+      "coupon": 0.0275,
       "reference_yield": 0.015
     },
     {
       "name": "次级",
-      "share": 0.0925,
+      "share": 0.092503,
       "rating": "未评级",
       "mode": "residual",
       "reference_yield": 0.015,
       "income_rate": 0.03
     }
   ],
+  "computed": {
+    "note": "share 为【占资产池初始余额】的比例；披露占比是占证券发行总额，需乘以 证券总额/资产池。",
+    "securities_total": 1500000000,
+    "pool_balance": 1503189400,
+    "ratio_securities_to_pool": 0.997879,
+    "overcollateralization": 3189400,
+    "oc_rate": 0.002122
+  },
+  "disclosed": {
+    "tranche_size_wan": {"优先A": 111900, "优先B": 8700, "优先C": 15500, "次级": 13900},
+    "tranche_pct_of_securities": {"优先A": 0.746, "优先B": 0.058, "优先C": 0.1033, "次级": 0.0927},
+    "coupon": {"优先A": 0.0185, "优先B": 0.022, "优先C": 0.0275, "次级": null},
+    "expected_maturity": {
+      "优先A": "2026-06-26", "优先B": "2026-07-26", "优先C": "2026-08-26", "次级": "2027-03-26"
+    },
+    "legal_maturity": "2030-03-26",
+    "trust_effective_date": "2025-06-26",
+    "revolving_end_date": "2026-02-28",
+    "sub_issue_price": 100,
+    "liquidity_reserve": "未设固定初始金额；贷款服务机构维持全部必备评级时限额为零"
+  },
   "scenarios": [
     {
       "id": "base",
       "label": "基准情景",
-      "note": "披露值：核销率 3.14%、月还款率 19.87%、购买率 100%",
+      "note": "披露值：核销率 3.14%、月还款率 19.87%、购买率 100%、回收率 3.31%",
       "co_mult": 1.0,
       "mrr_mult": 1.0,
       "recovery_mult": 1.0,
@@ -87,61 +115,21 @@
     }
   ],
   "disclosed_support": {
-    "优先A": 0.2556,
-    "优先B": 0.1977,
-    "优先C": 0.0946
+    "优先A": 0.2539,
+    "优先B": 0.1962,
+    "优先C": 0.0927
   },
   "param_sources": {
-    "balance": [
-      "披露",
-      "初始资产池未偿本金 150,318.94 万元（含超额抵押 318.94 万元）"
-    ],
-    "annual_yield": [
-      "披露",
-      "加权平均现行贷款年利率 21.15%"
-    ],
-    "charge_off_rate": [
-      "披露",
-      "量化参数·核销率 3.14%（历史静态池平均）"
-    ],
-    "monthly_repayment_rate": [
-      "披露",
-      "量化参数·月还款率 19.87%"
-    ],
-    "reinvest_rate": [
-      "披露",
-      "量化参数·购买率 100%"
-    ],
-    "recovery_rate": [
-      "披露",
-      "中债资信《表15：压力测试的基准条件和加压幅度》基准条件 3.31%；加压幅度为下降 10%/20%/降至 0"
-    ],
-    "recovery_lag_months": [
-      "披露",
-      "中债资信《表15》基准条件「回收周期(月)」= 6。原件未使用「回收滞后」一词，本模型按回收周期 6 个月处理"
-    ],
-    "servicing_fee_rate": [
-      "假设",
-      "说明书「参与机构」章节未摘录到具体费率，按 0.5%/年假设"
-    ],
-    "revolving_months": [
-      "披露",
-      "发行说明书「持续购买」期限 8 个月（原件用「持续购买」，非「循环购买」）"
-    ],
-    "amort_months": [
-      "假设",
-      "摊还期上限按 12 个月（说明书有摊还期章节，具体月数待补录）"
-    ]
+    "balance": ["披露", "初始资产池未偿本金 150,318.94 万元（含超额抵押 318.94 万元）"],
+    "annual_yield": ["披露", "加权平均现行贷款年利率 21.15%"],
+    "charge_off_rate": ["披露", "量化参数·核销率 3.14%（历史静态池平均）"],
+    "monthly_repayment_rate": ["披露", "量化参数·月还款率 19.87%"],
+    "reinvest_rate": ["披露", "量化参数·购买率 100%"],
+    "recovery_rate": ["披露", "中债资信《表15》基准条件 3.31%；加压幅度下降 10%/20%/降至 0"],
+    "recovery_lag_months": ["披露", "中债资信《表15》「回收周期(月)」= 6。原件无「回收滞后」一词，模型按回收周期映射"],
+    "revolving_months": ["披露", "发行说明书「持续购买终止日」= 信托成立后届满 8 个月所在月最后一日（2025-06-26 → 2026-02-28）"],
+    "amort_months": ["披露", "持续购买终止日 2026-02-28 至次级预期到期日 2027-03-26，约 13 个月"],
+    "servicing_fee_rate": ["假设", "说明书《主定义表》(152)(153) 仅规定前端/后端服务报酬「由收费文件约定」，未载明费率、计费基数与周期。0.5%/年无文件依据，属模型假设"]
   },
-  "additional_sources": [
-    {
-      "name": "中债资信评估有限责任公司《鼎柚2025年第三期个人消费贷款资产支持证券信用评级报告》",
-      "used_for": "表15 压力测试基准条件（回收率 3.31%、回收周期 6 个月）；静态样本池累计违约率"
-    },
-    {
-      "name": "中国对外经济贸易信托有限公司《鼎柚2025年第三期个人消费贷款资产支持证券发行说明书》",
-      "used_for": "持续购买期限 8 个月、摊还期、加速清偿事件、现金流支付顺序"
-    }
-  ],
-  "tranche_sources": "分层占比取自评级报告交易概览表（按资产占比口径），加总 99.79%，余额 0.21% 为超额抵押"
+  "tranche_sources": "分层规模/占比/票面/到期日均取自发行说明书与簿记建档发行结果公告；share 已按 证券总额÷资产池 = 99.7879% 折算为占资产池比例"
 }

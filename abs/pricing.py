@@ -43,7 +43,10 @@ def solve_coupons(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
     from .waterfall import run_waterfall
 
     for t in tranches:
-        if t.mode != "solve" or t.target_yield <= 0:
+        if t.mode != "solve":
+            # fixed：沿用给定票面；residual：无票面。两者都不参与反解。
+            continue
+        if t.target_yield <= 0:
             t.coupon = 0.0
             continue
         lo, hi = 0.0, 0.60
