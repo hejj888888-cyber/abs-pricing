@@ -29,6 +29,15 @@
 
 同理，月还款率的分母也是「静态资产池初始放款金额」，不是当期余额（方法 p.6）。
 两个指标同分母，队列寿命因此由二者共同决定，见 cashflow.py 顶部说明。
+
+## 回收分布（第 3 周新增，显式建模假设）
+
+评级报告《表15》只给出「回收周期 6 个月」和「核销后回收率」，**没有披露回收款
+在 6 个月内如何分布**。本模型默认把全部回收款放在第 6 月一次性到账（与原件
+「回收周期」的语义映射一致，见 cases/README.md）；`recovery_distribution` 允许
+把同一笔核销的回收款按核销后月序 k=0,1,2,... 铺开，用于敏感性分析。
+
+任何非默认分布都是**自己引入的、原件没有的假设**，不得写成披露值。
 """
 
 from dataclasses import dataclass
@@ -50,6 +59,7 @@ class Pool:
     tax_rate: float = 0.0          # 证券税率（年化，对利息收入计提）
     revolving_first_pay_interest_only: bool = False  # 摊还期首个支付日只付息不还本
     yield_ramp_months: int = -1    # 收益率加压过渡月数；-1 表示与 ramp_months 相同
+    recovery_distribution: tuple = ()  # 回收按月分布权重；空 = 用 recovery_lag_months 定点滞后
 
     @classmethod
     def from_dict(cls, d):
@@ -69,6 +79,8 @@ class Pool:
             revolving_first_pay_interest_only=bool(
                 d.get("revolving_first_pay_interest_only", False)),
             yield_ramp_months=int(d.get("yield_ramp_months", -1)),
+            recovery_distribution=tuple(
+                float(x) for x in (d.get("recovery_distribution") or [])),
         )
 
     def monthly_rate(self):
@@ -82,3 +94,20 @@ class Pool:
         """队列寿命（月）：(1 − 核销率) / 月还款率。见 cashflow.py 顶部说明。"""
         r = self.monthly_repayment_rate if mrr is None else mrr
         return max(int(round((1.0 - min(self.charge_off_rate, 0.9)) / max(r, 1e-6))), 1)
+
+    def recovery_weights(self):
+        """回收款在核销后各月的到账权重，和为 1。
+
+        索引 k 表示「核销发生月 + k」。未配置分布时退化为
+        `[0]*lag + [1]` 的 one-hot 向量，与旧版定点滞后逐行等价；
+        这是回归测试的基准，也是两单 case 的默认口径。
+
+        配置分布时按非负权重归一化；全零或空则同样退回 one-hot。
+        公开文件未披露分布形状，非默认值一律属显式建模假设。
+        """
+        ws = [max(float(x), 0.0) for x in (self.recovery_distribution or ())]
+        total = sum(ws)
+        if ws and total > 0:
+            return [x / total for x in ws]
+        lag = max(int(self.recovery_lag_months), 0)
+        return [0.0] * lag + [1.0]

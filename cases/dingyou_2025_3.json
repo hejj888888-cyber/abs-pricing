@@ -13,6 +13,7 @@
     "charge_off_rate": 0.0314,
     "recovery_rate": 0.0331,
     "recovery_lag_months": 6,
+    "recovery_distribution": [],
     "servicing_fee_rate": 0.0001,
     "revolving_months": 8,
     "amort_months": 13,
@@ -194,6 +195,10 @@
     "recovery_lag_months": [
       "披露",
       "中债资信《表15》「回收周期(月)」= 6。原件无「回收滞后」一词，模型按回收周期映射"
+    ],
+    "recovery_distribution": [
+      "假设",
+      "原件只披露「回收周期 6 个月」，未披露回收款在 6 个月内的分布形状。[] 表示第 6 月一次性到账（定点滞后）；任何非空分布均为本模型显式引入的假设，不得写成披露值。见 docs/recovery-timing.md"
     ],
     "revolving_months": [
       "披露",

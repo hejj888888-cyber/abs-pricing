@@ -51,6 +51,22 @@
 分子口径的一致性：方法文件 p.5 写明「逾期超过 30 天记为违约资产，逾期超过 90 天
 记为核销资产」，而两单说明书的「违约贷款」定义为逾期超过 90 日——**两者是同一批
 资产**。因此累计核销额可以直接作为累计违约率的分子。
+
+## 回收事件为什么显式排程（第 3 周）
+
+旧实现用 `pending = [(核销月, 核销额)]` 全局聚合，到「核销月 + lag」一次性回收，
+三个问题：① 不能表达月度分布；② 不按队列追踪；③ 余额归零后的尾部回收靠一段
+单独的补记循环，且 break 只看最后一条事件，分布一长就会漏记或提前退出。
+
+现在改为 `recovery_events: {到期月: 到账额}`：当期核销按 `pool.recovery_weights()`
+把 `co × rec_rate × w[k]` 排入 `m + k` 月，主循环每月 pop 当月应到账额。主循环
+一直跑到事件表清空才退出，故余额归零后的回收款完整入账，不再有 capping 截断。
+默认 one-hot 分布与旧行为逐行等价（见 `tests/test_recovery.py` 与基线 diff）。
+
+**注意回收时序不是中性的**：回收款进入循环期可购买资金（`cash` 含 `cum_recovery`
+与当月 `recovery`），改到账月份会改变当月购买额、队列规模、后续利息与核销，
+也就是会改变总量。这与第 2 周账龄曲线「只改时序、总量不变」不同，不能套用
+两遍跑法；分布只能作为敏感性开关，基准仍用与披露口径一致的定点滞后。
 """
 
 import math
@@ -80,7 +96,7 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
     yield_final = pool.annual_yield * yield_mult
     reinvest = min(max(pool.reinvest_rate, 0.0), 1.0)
     rec_rate = min(pool.recovery_rate * recovery_mult, 1.0)
-    lag = max(int(pool.recovery_lag_months), 0)
+    rec_weights = pool.recovery_weights()
 
     # 收益率与核销率的过渡期长度可以不同：够花 AAAsf 情景下收益率不设过渡
     # （条款下限 20% 直接作为压力参数），核销率仍设 4 个月过渡。
@@ -133,14 +149,15 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
     add_cohort(pool.balance, 1)
 
     rows = []
-    pending = []              # (发生月, 核销额)，用于计算滞后回收
+    recovery_events = {}      # 到期月 -> 当月应到账的回收额（已乘 rec_rate）
     cum_co = 0.0
     cum_purchased = 0.0       # 持续购买累计本金，累计违约率分母的组成部分
     cum_gross_principal = 0.0
     cum_recovery = 0.0
     first_amort_month = rev + 1
     m = 1
-    end = rev + pool.amort_months + 24
+    # 多留 len(rec_weights) 个月，保证最后一笔核销的分布尾部也落进主循环
+    end = rev + pool.amort_months + 24 + len(rec_weights)
 
     while m <= end:
         interest = 0.0
@@ -168,10 +185,17 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
             sched += p
             co += d
 
-        recovery = sum(a for (mm, a) in pending if m - mm == lag) * rec_rate
-        pending = [(mm, a) for (mm, a) in pending if m - mm != lag]
+        # 当期核销按分布排入未来各月的回收事件。排在 pop 之前，是为了让
+        # k=0（核销当月即回收）也能计入本月；one-hot 时只有 k=lag 一项。
         if co > 0:
-            pending.append((m, co))
+            for k, w in enumerate(rec_weights):
+                if w > 0.0:
+                    t = m + k
+                    recovery_events[t] = (recovery_events.get(t, 0.0)
+                                          + co * rec_rate * w)
+
+        # 本月应到账的回收款，可来自多个不同月份核销的叠加
+        recovery = recovery_events.pop(m, 0.0)
 
         fee = live * pool.servicing_fee_rate / 12.0
         tax = interest * pool.tax_rate
@@ -212,42 +236,13 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
             "cum_default_rate": cum_co / (pool.balance + cum_purchased),
         })
 
-        if m > rev and live <= 1e-6 and not pending:
+        # 余额归零后仍可能有未到期的回收事件，主循环继续跑到事件表清空，
+        # 因此不再需要单独的尾部补记循环，也不会被 capping 截断。
+        if m > rev and live <= 1e-6 and not recovery_events:
             break
-        if m > rev and live <= 1e-6:
-            # 余额归零但仍有未到期回收款，继续把回收款记入
-            if m >= (pending[-1][0] + lag if pending else m):
-                break
 
         if purchase > 0:
             add_cohort(purchase, m + 1)
-        m += 1
-
-    # 余额归零后仍在回收期内的月份继续入账
-    last_def = pending[-1][0] if pending else 0
-    while m <= last_def + lag and m <= end:
-        recovery = sum(a for (mm, a) in pending if m - mm == lag) * rec_rate
-        pending = [(mm, a) for (mm, a) in pending if m - mm != lag]
-        cum_recovery += recovery
-        rows.append({
-            "month": m,
-            "phase": "tail",
-            "bal_begin": 0.0,
-            "interest": 0.0,
-            "principal": recovery,
-            "gross_principal": 0.0,
-            "recovery": recovery,
-            "purchase": 0.0,
-            "charge_off": 0.0,
-            "servicing_fee": 0.0,
-            "tax": 0.0,
-            "total_collection": recovery,
-            "bal_end": 0.0,
-            "distribute_principal": True,
-            "cum_charge_off_rate": cum_co / pool.balance,
-            "cum_purchased": cum_purchased,
-            "cum_default_rate": cum_co / (pool.balance + cum_purchased),
-        })
         m += 1
 
     return rows

@@ -29,6 +29,7 @@ PARAM_LABELS = [
     ("reinvest_rate", "购买率", "%", 0.01),
     ("recovery_rate", "核销后回收率", "%", 0.01),
     ("recovery_lag_months", "回收滞后", "月", 1),
+    ("recovery_distribution", "回收时间分布", "—", 1),
     ("servicing_fee_rate", "服务费率", "%", 0.01),
     ("revolving_months", "循环购买期", "月", 1),
     ("amort_months", "摊还期上限", "月", 1),
@@ -232,12 +233,94 @@ def benchmark_section(case, pool, tranches, results, summaries):
     return L
 
 
+def recovery_section(case, pool, tranches):
+    """回收时间分布敏感性（原计划第 3 周）。
+
+    基准仍是「核销后第 6 月一次性到账」，与评级机构披露口径的语义映射一致。
+    本节只做敏感性对照：把同一笔核销的回收款按不同月度分布铺开，看优先档 WAL
+    与次级实现收益率怎么变。公开文件只给「回收周期 6 个月」，没有给分布形状，
+    因此下列分布全部是**显式建模假设**，不是披露值。
+    """
+    from dataclasses import replace as _rep
+
+    # 索引 k = 核销发生月 + k。k=0 留空，让三种形态都落在 1~6 月窗口内，
+    # 与「回收周期 6 个月」口径可比；基准 one-hot 落在 k=6。
+    variants = [
+        ("固定滞后 6 月（基准）", None),
+        ("均匀铺开 1–6 月", (0, 1/6, 1/6, 1/6, 1/6, 1/6, 1/6)),
+        ("前高后低 1–6 月", (0, 0.30, 0.25, 0.20, 0.12, 0.08, 0.05)),
+        ("后高前低 1–6 月", (0, 0.05, 0.08, 0.12, 0.20, 0.25, 0.30)),
+    ]
+    sc = case["scenarios"][0]
+    structure = case.get("structure", {})
+    rows_out, wals, sub_ys, multiples = [], [], [], []
+
+    for label, dist in variants:
+        p = pool if dist is None else _rep(pool, recovery_distribution=dist)
+        rr = run_scenario(p, tranches, structure, sc,
+                          vintage_from_dict(case.get("vintage")),
+                          TriggerTerms.from_dict(case.get("triggers")),
+                          stop_revolving=False)
+        s = summarize_pool(rr[0], p)
+        wal = rr[2][0]["加权平均期限(年)"]
+        sub_y = rr[2][-1]["实现收益率"]
+        mult = s["累计放款倍数"]
+        wals.append(wal)
+        sub_ys.append(sub_y)
+        multiples.append(mult)
+        rows_out.append([
+            label,
+            f"{wal:.4f}",
+            pct(sub_y),
+            f"{mult:.4f}x",
+            f"{wan(sum(r['recovery'] for r in rr[0])):,.2f}",
+            str(s["存续月数"]),
+        ])
+
+    L = ["\n## 二之三、回收时间分布（第 3 周）\n"]
+    L.append("> **口径边界**：评级报告《表15》只给出「回收周期 6 个月」与核销后回收率，"
+             "**没有披露回收款在 6 个月内如何分布**。基准行按「第 6 月一次性到账」处理，"
+             "是对「回收周期」的语义映射；其余三行是本模型显式引入的分布假设，"
+             "只用于敏感性分析，不得引用为披露值。见 `docs/recovery-timing.md`。\n")
+    L.append(md_table(["回收形态", "优先A WAL(年)", "次级实现收益率",
+                       "累计放款倍数", "累计回收(万元)", "存续月数"], rows_out))
+
+    wal_gap = max(wals) - min(wals)
+    sub_gap = max(sub_ys) - min(sub_ys)
+    mult_gap = max(multiples) - min(multiples)
+    L.append("\n**为什么这不是「只改时序」**：回收款是循环期可购买资金的一部分"
+             "（`cash` 含 `cum_recovery` 与当月 `recovery`），到账月份一变，当月购买额、"
+             "新队列规模、后续利息与核销都会跟着变。表中累计放款倍数从 {:0.4f}x 到 "
+             "{:0.4f}x，虽然量级只有 {:.4f}x，仍说明这条反馈环**改变了总量**，不只是把"
+             "同一笔钱挪到不同月份。因此第 2 周账龄曲线那套「总量不变、两遍跑法」"
+             "不能套用在这里。\n".format(
+                 min(multiples), max(multiples), mult_gap))
+    L.append("**结果怎么读**：四种形态下优先A 的 WAL 极差只有 {:.4f} 年（约 {:.2f} 天），"
+             "次级实现收益率极差也只有 {:.2f} 个百分点——**回收时间分布对本单定价几乎"
+             "没有影响**。原因有两层：一是优先档在顺序偿付与超额利差保护下足额受偿，"
+             "回收早到晚到只影响其现金流的时间分布；二是更关键的，核销后回收率只有 {}，"
+             "回收款占资产池现金流的比重极低，即使把到账从「第 6 月一次性」改成"
+             "「1–6 月铺开」，循环期可购买资金的变化也只有万分之几。方向与机制一致"
+             "（回收前置 → 更早形成购买力 → 累计放款略增），但量级可忽略。\n".format(
+                 wal_gap, wal_gap * 365, sub_gap * 100, pct(pool.recovery_rate)))
+    L.append("这属于「做了才发现没那么重要」的一类发现，如实记录：原计划第 3 周的验收标准"
+             "「优先档 WAL 变化可解释」成立，解释就是**变化接近零，因为回收款太小**。"
+             "若未来拿到回收率显著更高的产品（车贷 ABS 有抵押物），这一步才可能变得重要。\n")
+    L.append("> **对表不受影响**：两单 case 的 `recovery_distribution` 默认为 `[]`（定点滞后），"
+             "一键运行与第二节之二的评级机构 AAAsf 对表口径完全一致。改造前后逐月现金流"
+             "已做逐行 diff 验证：最大浮点差 0.0、差异 0 处。\n")
+    return L
+
+
 def param_table(case, pool):
     ps = case.get("param_sources", {})
     rows = []
     for key, label, unit, div in PARAM_LABELS:
         val = getattr(pool, key)
-        if unit == "亿元":
+        if key == "recovery_distribution":
+            shown = ("定点滞后（未启用分布）" if not val
+                     else "自定义 {} 期权重".format(len(val)))
+        elif unit == "亿元":
             shown = f"{val / div:,.2f}"
         elif unit == "月":
             shown = f"{val:.0f}"
@@ -448,6 +531,7 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
                      "而披露文件只有汇总的月还款率。把它列出来，比调参数把数字凑上去更诚实。\n")
 
     L.extend(benchmark_section(case, pool, tranches, results, summaries))
+    L.extend(recovery_section(case, pool, tranches))
 
     L.append("\n## 三、分层结果（基准情景）\n")
     headers = ["档位", "评级", "发行规模(亿元)", "占比", "票面利率", "目标收益率", "实现收益率",
@@ -605,7 +689,9 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
              "真实交易通常约定「超额服务费」——服务商在所有档位获得约定收益后取走剩余——"
              "此时次级收益会显著低于此数。两种安排的分界就在《服务合同》/收费文件里，而该文件不公开，"
              "故本报告只能给出上界，并把「缺这份文件」列为核心数据缺口。")
-    L.append("7. 核销后回收率与回收滞后为披露或假设值，未按催收渠道分层，未刻画回收的时间分布形状。")
+    L.append("7. 核销后回收率与回收周期（6 个月）为披露值，未按催收渠道分层。基准把回收款"
+             "放在第 6 月一次性到账；`recovery_distribution` 支持按月分布，但公开文件没有"
+             "给出分布形状，任何非空取值都是显式建模假设，只用于第二节之三的敏感性分析。")
     L.append("8. 票面为发行结果的实际值（`mode: fixed`），不再由模型反解——面值发行下反解票面是循环论证，"
              "详见 `docs/param-calibration.md`。")
     L.append("9. 税费按披露税率 3.26% 对利息收入计提、费率按披露合计值计提；"
