@@ -32,24 +32,45 @@ def sample_tranches():
 
 
 class TestPool(unittest.TestCase):
-    def test_mdr_consistency(self):
-        p = sample_pool(charge_off_rate=0.0314)
-        self.assertAlmostEqual((1 - p.mdr()) ** 12, 1 - 0.0314, places=10)
+    def test_charge_off_is_lifetime_cumulative(self):
+        """核销率是**累计终身**口径，不是年化率。
+
+        联合资信评级方法 p.5：核销率 = 正常还款周期 90 天后仍逾期的未偿本金余额 /
+        静态资产池初始放款金额。分子是最终核销掉的本金，故累计核销量应等于
+        「核销率 × 初始放款金额」。第一版按年化率拆月，累计损失只有这个数的一半。
+        """
+        p = sample_pool(charge_off_rate=0.1727, monthly_repayment_rate=0.0994,
+                        revolving_months=0, recovery_rate=0.0)
+        rows = build_schedule(p)
+        total_co = sum(r["charge_off"] for r in rows)
+        self.assertAlmostEqual(total_co, 0.1727 * p.balance,
+                               delta=0.01 * 0.1727 * p.balance)
 
     def test_zero_charge_off(self):
         p = sample_pool(charge_off_rate=0.0)
-        self.assertEqual(p.mdr(), 0.0)
+        rows = build_schedule(p)
+        self.assertAlmostEqual(sum(r["charge_off"] for r in rows), 0.0, delta=1e-6)
 
 
 class TestCashflow(unittest.TestCase):
-    def test_revolving_keeps_balance(self):
-        p = sample_pool(revolving_months=6)
+    def test_full_reinvest_keeps_balance_when_no_loss(self):
+        """购买率 100% 且无损失时，循环期内资产池余额保持不变、不向证券端过手本金。"""
+        p = sample_pool(revolving_months=6, charge_off_rate=0.0, recovery_rate=0.0)
         rows = build_schedule(p)
         rev = [r for r in rows if r["phase"] == "revolving"]
         self.assertEqual(len(rev), 6)
         for r in rev:
             self.assertAlmostEqual(r["bal_end"], p.balance, delta=1.0)
             self.assertAlmostEqual(r["principal"], 0.0, delta=1.0)
+
+    def test_reinvest_replaces_repaid_principal_only(self):
+        """持续购买只替换已偿还本金，不补足核销掉的本金——余额按累计核销递减。"""
+        p = sample_pool(revolving_months=6, charge_off_rate=0.10, recovery_rate=0.0)
+        rows = build_schedule(p)
+        rev = [r for r in rows if r["phase"] == "revolving"]
+        last = rev[-1]
+        cum_co = sum(r["charge_off"] for r in rev)
+        self.assertAlmostEqual(last["bal_end"], p.balance - cum_co, delta=1.0)
 
     def test_amortization_drains_balance(self):
         p = sample_pool()

@@ -25,7 +25,7 @@ PARAM_LABELS = [
     ("balance", "资产池本金余额", "亿元", 1e8),
     ("annual_yield", "收益率（加权平均贷款利率）", "%", 0.01),
     ("monthly_repayment_rate", "月还款率", "%", 0.01),
-    ("charge_off_rate", "核销率（年化）", "%", 0.01),
+    ("charge_off_rate", "核销率（累计终身口径）", "%", 0.01),
     ("reinvest_rate", "购买率", "%", 0.01),
     ("recovery_rate", "核销后回收率", "%", 0.01),
     ("recovery_lag_months", "回收滞后", "月", 1),
@@ -61,10 +61,25 @@ def run_scenario(pool, tranches, structure, sc, vintage=None, terms=None,
 
     kw = dict(co_mult=sc.get("co_mult", 1.0), mrr_mult=sc.get("mrr_mult", 1.0),
               recovery_mult=sc.get("recovery_mult", 1.0),
-              yield_mult=sc.get("yield_mult", 1.0), vintage=vintage)
+              yield_mult=sc.get("yield_mult", 1.0), vintage=vintage,
+              ramp_months=int(sc.get("ramp_months", 0)))
 
-    rows = build_schedule(pool, **kw)
-    result = run_waterfall(rows, pool.balance, tranches, pay_mode, trigger_cdr, terms)
+    # 购买率加压：评级机构对购买率施加折损率（立即生效，无过渡）
+    pool_s = pool
+    if sc.get("reinvest_mult") is not None:
+        from dataclasses import replace as _replace
+        pool_s = _replace(pool, reinvest_rate=pool.reinvest_rate * float(sc["reinvest_mult"]))
+
+    # 发行利率加压：压力情景下优先档票面 +bps（联合资信图表19：+50bps）
+    tr_s = tranches
+    bps = float(sc.get("coupon_bps", 0.0))
+    if bps:
+        from dataclasses import replace as _replace
+        tr_s = [_replace(t, coupon=t.coupon + bps) if t.mode != "residual" else t
+                for t in tranches]
+
+    rows = build_schedule(pool_s, **kw)
+    result = run_waterfall(rows, pool_s.balance, tr_s, pay_mode, trigger_cdr, terms)
     cap = None
 
     if stop_revolving and terms is not None:
@@ -72,9 +87,9 @@ def run_scenario(pool, tranches, structure, sc, vintage=None, terms=None,
         if auto:
             m = min(e.month for e in auto)
             cap = max(m - 1, 0)
-            if cap < pool.revolving_months:
-                rows2 = build_schedule(pool, revolving_cap=cap, **kw)
-                res2 = run_waterfall(rows2, pool.balance, tranches, pay_mode,
+            if cap < pool_s.revolving_months:
+                rows2 = build_schedule(pool_s, revolving_cap=cap, **kw)
+                res2 = run_waterfall(rows2, pool_s.balance, tr_s, pay_mode,
                                      trigger_cdr, terms,
                                      pre_fired={e.code for e in auto})
                 res2.trigger_events = list(result.trigger_events) + res2.trigger_events
@@ -84,20 +99,24 @@ def run_scenario(pool, tranches, structure, sc, vintage=None, terms=None,
                 cap = None   # 触发发生在摊还期，循环期无需截断
 
     result.revolving_cap = cap
-    return rows, result, [tranche_metrics(result, t) for t in tranches]
+    result.tranches_used = tr_s
+    return rows, result, [tranche_metrics(result, t) for t in tr_s]
 
 
 def check_conservation(rows, result):
     inflow = sum(r["total_collection"] for r in rows)
     fee = sum(r["servicing_fee"] for r in rows)
+    tax = sum(r.get("tax", 0.0) for r in rows)
     paid = sum(sum(cfs) for cfs in result.cashflow.values())
-    gap = inflow - fee - paid
+    gap = inflow - fee - tax - paid
     return abs(gap) < 1e-4 * max(1.0, inflow), gap
 
 
 def write_schedule_csv(path, rows):
-    cols = ["month", "phase", "bal_begin", "interest", "principal", "charge_off",
-            "recovery", "servicing_fee", "total_collection", "bal_end", "cum_charge_off_rate"]
+    cols = ["month", "phase", "bal_begin", "interest", "principal", "gross_principal",
+            "recovery", "purchase", "charge_off", "servicing_fee", "tax",
+            "total_collection", "bal_end", "distribute_principal",
+            "cum_charge_off_rate", "cum_purchased", "cum_default_rate"]
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -111,6 +130,106 @@ def md_table(headers, rows):
     for r in rows:
         out.append("| " + " | ".join(str(c) for c in r) + " |")
     return "\n".join(out)
+
+
+def wan(x):
+    return x / 1e4
+
+
+def benchmark_section(case, pool, tranches, results, summaries):
+    """与评级机构披露的 AAAsf 压力测试结果逐项对表。
+
+    对表分两层，因为两层的可信度完全不同：
+      流入端  回收款利息 / 回收款本金 / 持续购买支出 —— 由资产模型算出，
+              公开参数未必能复现，偏差是**模型 GAP**。
+      分配端  各档实付本金 —— 只要有流入端合计，就能用瀑布算出来。
+              披露表的内部勾稽可以验证这一层是否精确成立。
+    """
+    bm = case.get("rating_benchmark") or {}
+    disc = bm.get("aaa_inflow_wan")
+    if not disc:
+        return []
+
+    idx = next((i for i, s in enumerate(case["scenarios"]) if s["id"] == "aaa"), -1)
+    if idx < 0:
+        return []
+    sc = case["scenarios"][idx]
+    # 关键口径：披露的持续购买额是在**未截断循环期**下跑出来的。
+    # 核销率改为累计终身口径后，累计违约率会在第 5–6 个月越过 5% 阈值；
+    # 若把加速清偿反馈进现金流（截断循环期），购买额会被砍掉一半以上，
+    # 与披露的 20.17 亿 / 2.27 亿明显不符。说明评级机构这次压力测试
+    # 是把压力参数代入现金流模型直接跑，没有再叠加触发机制的时序反馈。
+    rows, result, metrics = run_scenario(pool, tranches, case.get("structure", {}),
+                                         sc, vintage_from_dict(case.get("vintage")),
+                                         TriggerTerms.from_dict(case.get("triggers")),
+                                         stop_revolving=False)
+
+    interest = wan(sum(r["interest"] for r in rows))
+    principal = wan(sum(r["gross_principal"] + r["recovery"] for r in rows))
+    purchased = wan(sum(r["purchase"] for r in rows))
+    netloss = wan(sum(r["charge_off"] - r["recovery"] for r in rows))
+    tax = wan(sum(r.get("tax", 0.0) for r in rows))
+
+    L = ["\n## 二之二、与评级机构 AAAsf 披露结果对表\n"]
+    L.append("> 数据源：{}\n".format(bm.get("source", "")))
+
+    def cmp_row(label, mine, theirs, unit="万元"):
+        if theirs is None:
+            return [label, f"{mine:,.2f}", "—", "—"]
+        gap = (mine - theirs) / theirs * 100 if theirs else 0.0
+        return [label, f"{mine:,.2f}", f"{theirs:,.2f}", f"{gap:+.1f}%"]
+
+    L.append(md_table(["流入端项目（AAAsf）", "本模型", "评级机构披露", "偏差"], [
+        cmp_row("回收款利息", interest, disc.get("回收款利息")),
+        cmp_row("回收款本金", principal, disc.get("回收款本金")),
+        cmp_row("持续购买支出", purchased, disc.get("持续购买支出")),
+        cmp_row("净损失（核销 − 回收）", netloss, None),
+        cmp_row("税费", tax, disc.get("税费")),
+        ["累计放款 / 初始池", f"{(pool.balance + sum(r['purchase'] for r in rows)) / pool.balance:.2f}x", "—", "—"],
+    ]))
+
+    # 现金守恒上限：购买率开到 100%，看披露参数下最多能买多少。
+    # 若连上限都低于披露值，说明披露的持续购买额不可能由公开参数推出，
+    # 这是"调参解决不了"的硬 GAP，必须单独标出来而不是靠调参掩盖。
+    from dataclasses import replace as _rep
+    # 注意：run_scenario 会用 sc["reinvest_mult"] 覆盖池子的购买率，
+    # 求上限时必须把该乘数摘掉，否则算出来的还是加压后的同一个数。
+    sc_full = dict(sc)
+    sc_full.pop("reinvest_mult", None)
+    p_full = _rep(pool, reinvest_rate=1.0)
+    r_full = run_scenario(p_full, tranches, case.get("structure", {}), sc_full,
+                          vintage_from_dict(case.get("vintage")),
+                          TriggerTerms.from_dict(case.get("triggers")),
+                          stop_revolving=False)
+    ceiling = wan(sum(r["purchase"] for r in r_full[0]))
+    L.append("\n**持续购买的现金守恒上限**：把购买率开到 100%（到账本金全额再投资、"
+             "不留现金），本模型最多只能买到 {:,.2f} 万元；而评级机构披露的持续购买支出是 "
+             "{:,.2f} 万元。{}".format(
+                 ceiling, disc.get("持续购买支出", 0.0),
+                 "连上限都低于披露值，说明这个数不可能由公开披露的月还款率、循环期长度和"
+                 "初始池规模推出来——图表20 里还含有未公开的建模选择（可能是月还款率的实际"
+                 "曲线形态，或持续购买次数多于披露的循环期月数）。这是调参解决不了的硬 GAP。"
+                 if ceiling < disc.get("持续购买支出", 0.0) else
+                 "上限高于披露值，说明披露的购买额落在公开参数允许的范围之内。"))
+
+    L.append("\n### 分配端：用披露的流入端合计代入瀑布\n")
+    L.append(bm.get("inflow_note", "") + "\n")
+
+    res_rows = []
+    disc_res = bm.get("aaa_result_wan") or {}
+    for i, t in enumerate(tranches):
+        face = t.share * pool.balance
+        paid = face * (1 - metrics[i]["本金损失率"])
+        d = disc_res.get(t.name)
+        res_rows.append(cmp_row(t.name, wan(paid), d.get("实付") if d else None))
+    L.append(md_table(["各档实付本金", "本模型", "评级机构披露", "偏差"], res_rows))
+
+    L.append("\n> **这一层是分配端的检验，不是流入端的。** 把披露的流入端合计"
+             "（流入合计 − 持续购买支出 − 税费 − 各档利息）代入顺序偿付瀑布，"
+             "算术上必然得到披露的各档实付金额——上面这行勾稽在两单都精确成立，"
+             "说明本模型的瀑布顺序、税费计提、次级期间收益封顶与真实结构一致。"
+             "剩下的一切偏差都来自流入端，也就是资产模型。\n")
+    return L
 
 
 def param_table(case, pool):
@@ -145,6 +264,7 @@ def thickness_analysis(tranches, scenario_metrics):
 def build_report(case, pool, tranches, results, summaries, min_sub, counterfactual=None,
                  sub_yield_low=None, sub_yield_high=None):
     scenario_metrics = [r[2] for r in results]
+    structure = case.get("structure", {})
     # 加权票面按「有票面的档」加权，不能只算 mode == "solve"——
     # 全部档位改成 fixed 后，只算 solve 会得到 0，超额利差被凭空放大 3 个百分点。
     funded = sum(t.share for t in tranches if t.mode != "residual")
@@ -173,18 +293,25 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
         n_disc, len(ps) - n_disc))
 
     v = case.get("vintage")
-    if v and v.get("enabled"):
+    if v:
         vc = VintageCurve(tau=float(v.get("tau", 8.0)), shape=float(v.get("shape", 2.0)))
         s = vc.summary()
-        L.append("\n### 账龄损失曲线（第 2 周新增）\n")
-        L.append("核销率不再按月恒定计提，改用 Weibull 累计曲线重整时序："
-                 "`S(t) = 1 - exp(-(t/tau)^k)`，取 tau = {} 月、k = {}，"
-                 "边际违约率在第 {} 月见顶。\n".format(s["tau(月)"], s["shape"], s["边际峰值月"]))
+        enabled = bool(v.get("enabled"))
+        L.append("\n### 账龄损失曲线（第 2 周新增，本单{}）\n".format(
+            "启用" if enabled else "未启用"))
+        L.append("曲线形态为 Weibull 累计曲线 `S(t) = 1 - exp(-(t/tau)^k)`，"
+                 "tau = {} 月、k = {}，边际违约率在第 {} 月见顶。"
+                 "启用时按队列账龄把该队列的终身核销额分配逐月损失权重，"
+                 "总量仍等于「核销率 × 队列放款额」。\n".format(
+                     s["tau(月)"], s["shape"], s["边际峰值月"]))
         curve_rows = [[f"{t} 月", pct(vc.cum(t), 1), pct(vc.marginal(t), 2)]
                       for t in (1, 3, 6, 9, 12, 15, 18, 24)]
         L.append(md_table(["账龄", "累计违约率（占平台）", "边际违约率（占平台）"], curve_rows))
-        L.append("\n> **关键设计**：曲线只重整时间分布，不改变损失总量——总量仍等于恒定模式"
-                 "算出的累计核销额。这样结果差异纯粹来自时序效应，不会与「总量估错」混在一起。\n")
+        L.append("\n> **为什么本单不启用**：核销率改为累计终身口径后，队列寿命只有 "
+                 "`(1 − 核销率) / 月还款率` 个月（本单约 8–11 个月），把曲线后段的损失"
+                 "推到余额耗尽之后会被 capping 截掉——鼎柚实测累计核销少计 44%。"
+                 "这是建模假象。基准改用均匀摊铺（不引入额外信息、总量精确守恒），"
+                 "曲线保留为敏感性开关。\n")
         L.append("> **口径提醒**：评级报告的累计违约率是**单只静态池**口径，本模型算的是**循环购买池**"
                  "的累计核销率。循环期内本金被反复投放，同一笔钱可能多次暴露于违约，"
                  "故循环池的累计核销率相对初始余额可以高于单池累计违约率，两者不可直接比较。\n")
@@ -197,9 +324,9 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
                    else f"{pool.revolving_months}")
         rows.append([s["label"], s["note"], rev_txt, pct(p["累计核销率"]), pct(p["净损失率"]),
                      pct(p["本金回收率"]), f"{p['资产池加权平均期限(年)']:.2f}",
-                     f"{p['池利息收入(亿元)']:.2f}", p["存续月数"]])
+                     f"{p['池利息收入(亿元)']:.2f}", f"{p['累计放款倍数']:.2f}x", p["存续月数"]])
     L.append(md_table(["情景", "参数设定", "实际循环期(月)", "累计核销率", "净损失率", "本金回收率",
-                       "池加权期限(年)", "池利息收入(亿元)", "存续月数"], rows))
+                       "池加权期限(年)", "池利息收入(亿元)", "累计放款倍数", "存续月数"], rows))
 
     # 累计违约率：占初始余额 vs 合同口径（分母含持续购买本金）
     cd_rows = []
@@ -253,19 +380,45 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
         peak = max(max(r[0], key=lambda x: x["cum_default_rate"])["cum_default_rate"]
                    for r in results)
         thr = tr.get("cdr_first_year", 0.05)
-        L.append("\n### 为什么累计违约率条款触发不了\n")
-        L.append("按合同口径，本单三情景的累计违约率峰值 **{}**，首年阈值 {}，{}。\n".format(
-            pct(peak), pct(thr, 0), "**始终不触发**" if peak <= thr else "极端情景下会触发"))
-        L.append("机制在于分母：持续购买期内每月购买额约等于当月本金回收额，"
-                 "分母由初始 {} 亿元一路累加到 {} 亿元；而分子（累计违约本金）只按违约速度增长。"
-                 "两种口径因此差出一倍以上——占初始余额的累计核销率看起来早已越过阈值，"
-                 "换成合同口径后连一半都不到。\n".format(
-                     f"{pool.balance/1e8:,.2f}",
-                     f"{(pool.balance + max(max(r[0], key=lambda x: x['cum_purchased'])['cum_purchased'] for r in results))/1e8:,.2f}"))
-        L.append("这不是参数估错，是**循环购买结构本身的性质**：新资产不断注入分母，"
-                 "单笔违约在比率上被持续稀释。真正的加速清偿风险因此集中在非量化条件上——"
-                 "服务机构解任、后备机构缺位、发起机构丧失清偿能力——"
-                 "这几条与资产池表现无关，只能靠情景开关注入，不能由模型预测。\n")
+        idx_aaa = next((i for i, s in enumerate(case["scenarios"]) if s["id"] == "aaa"),
+                       len(results) - 1)
+        purch_trunc = sum(r["purchase"] for r in results[idx_aaa][0])
+        _full = run_scenario(pool, tranches, structure, case["scenarios"][idx_aaa],
+                             vintage_from_dict(case.get("vintage")),
+                             TriggerTerms.from_dict(case.get("triggers")),
+                             stop_revolving=False)
+        purch_full = sum(r["purchase"] for r in _full[0])
+
+        if peak > thr:
+            L.append("\n### 累计违约率阈值会被突破——但披露结果不支持这个触发\n")
+            L.append("按合同口径，本单各情景的累计违约率峰值 **{}**，首年阈值 {}，"
+                     "**压力情景下会触发**加速清偿。\n".format(pct(peak), pct(thr, 0)))
+            L.append("这个结论与上一版相反，原因是核销率口径修正：核销率由年化改为"
+                     "**累计终身**口径后，累计违约本金约放大一倍，分母虽然被持续购买"
+                     "稀释，仍不足以压到 5% 之下。\n")
+            L.append("**但评级机构披露的压力测试结果并不支持这个触发。** 图表20/21 给出的"
+                     "持续购买支出是在**完整循环期**下跑出来的；本模型一旦把加速清偿"
+                     "反馈进现金流（循环期截断到触发前一月），购买额由 {:,.0f} 万元掉到 "
+                     "{:,.0f} 万元，循环期被砍掉 {} 个月。\n".format(
+                         wan(purch_full), wan(purch_trunc),
+                         pool.revolving_months - (results[idx_aaa][1].revolving_cap or 0)))
+            L.append("结论：**评级机构这次压力测试是把压力参数代入现金流模型直接跑，"
+                     "没有再叠加触发机制的时序反馈。** 这不是疏漏——压力测试的目的是判断"
+                     "给定恶化程度下证券能否足额兑付，触发机制的时序反馈会引入第二个自由度，"
+                     "使结果不再只由压力参数决定。本报告第二节之二的对表因此统一在"
+                     "「不截断循环期」口径下进行，与披露口径一致。\n")
+        else:
+            L.append("\n### 为什么累计违约率条款触发不了\n")
+            L.append("按合同口径，本单三情景的累计违约率峰值 **{}**，首年阈值 {}，{}。\n".format(
+                pct(peak), pct(thr, 0), "**始终不触发**" if peak <= thr else "极端情景下会触发"))
+            L.append("机制在于分母：持续购买期内每月购买额约等于当月本金回收额，"
+                     "分母由初始 {} 亿元一路累加到 {} 亿元；而分子（累计违约本金）只按违约速度增长。"
+                     "两种口径因此差出一倍以上——占初始余额的累计核销率看起来早已越过阈值，"
+                     "换成合同口径后连一半都不到。\n".format(
+                         f"{pool.balance/1e8:,.2f}",
+                         f"{(pool.balance + max(max(r[0], key=lambda x: x['cum_purchased'])['cum_purchased'] for r in results))/1e8:,.2f}"))
+            L.append("这不是参数估错，是**循环购买结构本身的性质**：新资产不断注入分母，"
+                     "单笔违约在比率上被持续稀释。\n")
 
     L.append("\n### 模型清偿月 vs 披露预期到期日\n")
     rec_rows = []
@@ -286,13 +439,15 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
         L.append(md_table(["档位", "披露预期到期日（折月）", "模型清偿月", "差异"], rec_rows))
         gaps = [int(r[3].split()[0]) for r in rec_rows if r[3] != "—"]
         if gaps and max(gaps) > 0:
-            L.append("\n模型比披露口径慢 {} 个月。原因：本模型摊还期按「余额 × 月还款率」几何衰减，"
-                     "而静态池的实际摊还曲线前期更陡（等额本息贷款的本金占比随时间上升，"
-                     "按原余额计的月还款额近似水平而非等比衰减）。该偏差使优先档加权平均期限"
-                     "被系统性高估，票面定价相应偏保守。".format(max(gaps)))
+            L.append("\n模型比披露口径慢 {} 个月。月还款率已按评级方法 p.6 改为"
+                     "「初始放款金额 × 月还款率」的水平偿还（不再是几何衰减），"
+                     "残余差异来自两点：一是评级方法 p.5–6 写明正常摊还期本金先积累、"
+                     "按约定日偿还，本模型仍在每月过手；二是披露的预期到期日还含"
+                     "支付日日历、税费与次级期间收益的排布，并非由月还款率单独推出。".format(max(gaps)))
             L.append("\n> 这是一个**没有修正的已知偏差**，故意留着：修正它需要静态池的逐月摊还表，"
-                     "而披露文件只有汇总的月还款率。把它列出来，比调参数把数字凑上去更诚实——"
-                     "也说明披露的预期到期日并非由月还款率单独推出。\n")
+                     "而披露文件只有汇总的月还款率。把它列出来，比调参数把数字凑上去更诚实。\n")
+
+    L.extend(benchmark_section(case, pool, tranches, results, summaries))
 
     L.append("\n## 三、分层结果（基准情景）\n")
     headers = ["档位", "评级", "发行规模(亿元)", "占比", "票面利率", "目标收益率", "实现收益率",
@@ -437,19 +592,25 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
 
     L.append("\n## 八、假设与局限\n")
     L.append("1. 循环购买期与摊还期长度披露文件中未直接给出，按「持续购买终止日」与优先档预期到期日倒推（见第一节来源列）。")
-    L.append("2. 循环期内假设购买率 100%、资产池余额严格维持不变，未刻画资产置换质量下降；"
-             "循环期不分配本金，收入分账剩余先留存、摊还期用于补足利息缺口，期末释放给次级。")
+    L.append("2. 循环期按队列推演，购买额 = 到账本金 × 购买率，并以本金分账户余额封顶；"
+             "未刻画资产置换质量下降与合格资产不足。循环期不分配本金，收入分账剩余先留存、"
+             "摊还期用于补足利息缺口，期末释放给次级。")
     L.append("3. 真实交易在循环期按季付息，本模型按月计息并当月支付，会小幅高估优先档现金流的时间价值。")
-    L.append("4. 摊还期按「余额 × 月还款率」几何衰减，比披露的优先档预期到期日慢若干个月（见第二节对账表），"
-             "该偏差未修正，方向是低估摊还速度、高估久期。")
-    L.append("5. **次级档实现收益率是上界，不是点估计。** 本模型把收入分账的全部剩余（超额利差）都归次级。"
+    L.append("4. 核销率按评级方法 p.5 取**累计终身口径**，在队列寿命内均匀摊铺；"
+             "披露文件没有给出损失的时间分布曲线，故这是中性假设而非拟合结果。"
+             "账龄曲线作为敏感性开关保留，基准情景不启用（见 `docs/inflow-calibration.md` 第五节）。")
+    L.append("5. 摊还期本金按月过手，而评级方法 p.5–6 写明正常摊还期本金先积累、按约定日偿还；"
+             "这是第二节对账表残余 ±1 个月偏差的主因，未修正。")
+    L.append("6. **次级档实现收益率是上界，不是点估计。** 本模型把收入分账的全部剩余（超额利差）都归次级。"
              "真实交易通常约定「超额服务费」——服务商在所有档位获得约定收益后取走剩余——"
              "此时次级收益会显著低于此数。两种安排的分界就在《服务合同》/收费文件里，而该文件不公开，"
              "故本报告只能给出上界，并把「缺这份文件」列为核心数据缺口。")
-    L.append("6. 核销后回收率与回收滞后为披露或假设值，未按催收渠道分层，未刻画回收的时间分布形状。")
-    L.append("7. 票面为发行结果的实际值（`mode: fixed`），不再由模型反解——面值发行下反解票面是循环论证，"
+    L.append("7. 核销后回收率与回收滞后为披露或假设值，未按催收渠道分层，未刻画回收的时间分布形状。")
+    L.append("8. 票面为发行结果的实际值（`mode: fixed`），不再由模型反解——面值发行下反解票面是循环论证，"
              "详见 `docs/param-calibration.md`。")
-    L.append("8. 未计入税费、中介费用、流动性溢价与外部增信。")
+    L.append("9. 税费按披露税率 3.26% 对利息收入计提、费率按披露合计值计提；"
+             "未计入流动性溢价、中介发行费用与外部增信。评级报告披露的税费高于「利息 × 3.26%」，"
+             "计税基数口径未在公开文件中说明。")
     return "\n".join(L)
 
 

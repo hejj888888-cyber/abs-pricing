@@ -1,213 +1,249 @@
-"""逐月现金流引擎（含循环购买期）。
+"""逐月现金流引擎（队列法 + 循环购买）。
 
 第 2 层：在资产池上按月推演，产出每月可分配给证券的现金。
 
-两个阶段：
-  循环购买期（1 ~ revolving_months）
-      本金回收按购买率再投资，资产池余额维持不变；证券端只收到利息与回收款，
-      优先档在这一阶段只付息、不还本（与真实交易"循环期按季付息"一致）。
-  摊还期（之后）
-      资产池按"月还款率"摊还，回收款不再投资，全额过手给证券端。
+## 三个口径（按《联合资信 消费金融类资产支持证券评级方法》p.5–p.6 原文修正）
 
-口径说明：
-  1. 利息按月初余额计。
-  2. 核销有两种模式：
-     - 恒定模式（默认）：年化核销率折算为月度核销率，逐月按余额计提。
-     - 账龄曲线模式（vintage）：保持核销总量不变，按 Weibull 累计曲线重新分配
-       到各月。目的是把"总量估得准不准"和"时间分布对不对"两个问题分开。
-  3. 核销后回收按固定回收率、固定滞后处理，未刻画回收的时间分布。
-  4. 循环期内假设购买率 100%、资产池余额严格维持不变（评级报告披露的量化参数假设）。
-
-## 月还款率的口径（第 3 周按《联合资信 消费金融类资产支持证券评级方法》修正）
-
-原实现按「当期余额 × 月还款率」逐月几何衰减，是错的。方法文件 p.5 的定义是：
+### 1. 月还款率：分母是初始放款金额，不是当期余额
 
     月还款率 = 静态资产池当月收到的本金 / 静态资产池初始放款金额
 
-分母是**初始放款金额**，不是当期余额。所以正确的推演是每月本金回款额近似为常数
-`初始本金 × 月还款率`（受剩余余额封顶），而不是余额的等比衰减。
+推论：一个队列每月偿还的本金是常数 `face × 月还款率`，而不是余额的等比衰减。
+按初始放款金额 F、月还款率 r，队列在 1/r 个月左右摊完。
 
-这个差别很大：几何衰减下池子永远摊不完（前慢后快），水平偿还下约 1/月还款率 个月
-摊完（鼎柚 5.0 个月、够花 6.2 个月）。修正后模型的优先档清偿月才与披露的预期到期日
-对得上。
+### 2. 核销率：累计终身口径，不是年化率  ← 本版最重要的修正
 
-## 累计违约率的分母（按两单说明书「累计违约率」定义修正）
+    核销率 = 正常还款周期 90 天后仍逾期的未偿本金余额 / 静态资产池初始放款金额
+
+分子是「最终核销掉的本金」，分母是初始放款金额。所以核销率是**一个队列在整个
+生命周期内的累计损失率**，不是年化率。此前版本按 `1-(1-年化率)^(1/12)` 拆月、
+再乘到逐月递减的余额上，把损失系统性低估了一半以上——这是模型偏乐观的主要来源。
+
+队列寿命由还款与核销共同决定：每月流出占 face 的比例为 `r + c/(1-c)·r`，
+故寿命 N = (1 − c) / r，期间累计核销恰为 `c × face`。
+
+### 3. 购买率：循环期内到账本金再投资的比例
+
+    购买率 = 当月新增资产规模 / 上月可用于购买的资金
+
+本模型按「当月到账本金（计划本金 + 回收款）× 购买率」购买，并以本金分账户
+可用余额封顶（现金守恒：累计购买额不可能超过累计到账本金）。
+
+## 为什么要按队列（cohort）推演
+
+旧实现只有一个"资产池余额"标量，循环期买进的资产**不产生任何现金流**——买入即
+消失，只是把余额撑住。真实结构里持续买进的资产会继续生息、继续摊还、继续违约，
+并在下一个分配日把本金再次用于购买，形成周转。
+
+按队列推演后，鼎柚 AAAsf 情景下累计放款达到初始池的 2.3 倍，与评级报告图表20
+披露的"持续购买支出 20.17 亿元"同一量级；旧实现只有 0.6 倍。
+
+## 累计违约率的分母（按两单说明书「累计违约率」定义）
 
     A = 各收款期间内所有违约贷款在成为违约贷款时的未偿本金余额之和
     B = 初始起算日资产池余额 + 各持续购买日购买的资产在持续购买基准日的未偿本金余额之和
 
-分母 B 要**加上历次持续购买的本金**，不是初始余额。循环购买结构下这个分母会快速膨胀，
-使累计违约率被显著稀释——这是循环结构里加速清偿不容易触发的机制性原因。
+分母 B 要**加上历次持续购买的本金**。循环购买结构下分母快速膨胀，累计违约率被
+显著稀释——这是循环结构里加速清偿不容易触发的机制性原因。
 本模块同时输出两个口径：`cum_charge_off_rate`（占初始余额）与
 `cum_default_rate`（占初始余额 + 累计购买本金），后者供触发判定使用。
 
-分子口径的一致性：方法文件 p.5 写明「逾期超过 30 天记为违约资产，逾期超过 90 天记为
-核销资产」，而两单说明书的「违约贷款」定义为逾期超过 90 日——**两者是同一批资产**。
-因此累计核销额可以直接作为累计违约率的分子，不需要再乘一个"违约→核销"的系数。
+分子口径的一致性：方法文件 p.5 写明「逾期超过 30 天记为违约资产，逾期超过 90 天
+记为核销资产」，而两单说明书的「违约贷款」定义为逾期超过 90 日——**两者是同一批
+资产**。因此累计核销额可以直接作为累计违约率的分子。
 """
+
+import math
 
 
 def build_schedule(pool, co_mult=1.0, mrr_mult=1.0, recovery_mult=1.0, yield_mult=1.0,
-                   vintage=None, revolving_cap=None):
+                   vintage=None, revolving_cap=None, ramp_months=0):
     """返回月度明细列表。mult 参数用于压力情景。
 
-    vintage 不为 None 时启用账龄曲线：先按恒定核销率跑一遍得到损失总量与期限，
-    再按曲线把同样的总量重新分配到各月。两遍结果的总核销量一致，差异纯粹来自时序。
+    vintage 不为 None 时启用账龄曲线：损失总量仍等于「核销率 × 各队列放款额」，
+    但按 Weibull 边际曲线在队列寿命内重新分配节奏（总量不变，只改时序）。
 
     revolving_cap 用于模拟「加速清偿 → 停止持续购买 → 提前进入摊还期」：
     给出则覆盖 pool.revolving_months 作为循环期的实际上限。
     """
     rev = pool.revolving_months if revolving_cap is None else max(int(revolving_cap), 0)
-
-    if vintage is not None:
-        # 两遍跑：先按恒定核销率得损失总量 L，再按曲线把 L 分发到各月。
-        # 但分发后余额轨迹变了，末期余额归零时 capping 会让实际总量偏离 L，
-        # 故做几次定点迭代：把上一轮实际总量与目标的比值作为修正系数重新分发。
-        # 修正到相对误差 < 1e-6 为止（通常 2–3 轮）。
-        base = build_schedule(pool, co_mult, mrr_mult, recovery_mult, yield_mult,
-                              revolving_cap=revolving_cap)
-        target = sum(r["charge_off"] for r in base)
-        n = len(base)
-        amounts = vintage.allocate(n, target,
-                                   revolving_months=rev,
-                                   seasoning_months=pool.seasoning_months)
-        for _ in range(6):
-            got = sum(r["charge_off"] for r in _build(
-                pool, co_mult, mrr_mult, recovery_mult, yield_mult,
-                co_amounts=amounts, revolving_months=rev))
-            if got <= 0:
-                break
-            gap = target / got
-            if abs(gap - 1.0) < 1e-6:
-                break
-            amounts = [a * gap for a in amounts]
-        return _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult,
-                      co_amounts=amounts, revolving_months=rev)
-
     return _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult,
-                  revolving_months=rev)
+                  vintage=vintage, revolving_months=rev, ramp_months=ramp_months)
 
 
-def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None,
-           revolving_months=None):
+def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
+           revolving_months=None, ramp_months=0):
     rev = pool.revolving_months if revolving_months is None else int(revolving_months)
-    rm = pool.monthly_rate() * yield_mult
+
     mrr = min(max(pool.monthly_repayment_rate * mrr_mult, 0.001), 0.95)
-    co_rate = min(pool.charge_off_rate * co_mult, 0.95)
-    mdr = 1 - (1 - co_rate) ** (1.0 / 12)
+    co_final = min(pool.charge_off_rate * co_mult, 0.95)
+    yield_final = pool.annual_yield * yield_mult
+    reinvest = min(max(pool.reinvest_rate, 0.0), 1.0)
     rec_rate = min(pool.recovery_rate * recovery_mult, 1.0)
-    lag = pool.recovery_lag_months
+    lag = max(int(pool.recovery_lag_months), 0)
 
-    def charge_off_of(m, bal):
-        """第 m 月的核销量。曲线模式下取预算额度，且不超过当期余额。"""
-        if co_amounts is None:
-            return bal * mdr
-        if m - 1 >= len(co_amounts):
-            return 0.0
-        return min(co_amounts[m - 1], bal)
+    # 收益率与核销率的过渡期长度可以不同：够花 AAAsf 情景下收益率不设过渡
+    # （条款下限 20% 直接作为压力参数），核销率仍设 4 个月过渡。
+    co_ramp = int(ramp_months)
+    y_ramp = int(getattr(pool, "yield_ramp_months", None) if
+                 getattr(pool, "yield_ramp_months", None) is not None else ramp_months)
 
-    def principal_of(bal):
-        """第 m 月的本金回款额。
+    def ramp(m, months):
+        """施压速度：从基准值经 months 个月线性达到压力值。
 
-        月还款率口径：当月收到本金 / 静态池**初始**放款金额，故回款额近似常数
-        `pool.balance * mrr`，以剩余余额封顶。原实现用 `bal * mrr`（几何衰减）是错的。
+        联合资信评级方法 p.7：AAA 级过渡时间 4 个月（AA+/AA-/A+ 为 6 个月），
+        月还款率与购买率不设过渡、直接达到压力值。
+        公开文件**没有披露过渡曲线的形态**，线性插值是我自己的建模假设。
         """
-        return min(pool.balance * mrr, bal)
+        if months <= 0:
+            return 1.0
+        return min(1.0, (m - 1) / float(months))
+
+    def rm_of(m):
+        return (pool.annual_yield + (yield_final - pool.annual_yield) * ramp(m, y_ramp)) / 12.0
+
+    def co_of(m):
+        return pool.charge_off_rate + (co_final - pool.charge_off_rate) * ramp(m, co_ramp)
+
+    def life_months(c):
+        """队列寿命（月）：还款与核销共同把余额耗尽的时点。"""
+        c = min(max(c, 0.0), 0.9)
+        return max(int(round((1.0 - c) / mrr)), 1)
+
+    def loss_weights(c, born_month):
+        """队列寿命内各账龄月的核销权重，和为 1。"""
+        n = life_months(c)
+        if vintage is None:
+            return [1.0 / n] * n
+        ws = vintage.weights(n, shift=int(pool.seasoning_months))
+        return ws if ws else [1.0 / n] * n
+
+    # ---- 队列状态 ----
+    # 每个队列记录：face（初始放款金额）、paid（已还本金）、co（已核销）、
+    # born（成立的日历月）、w（核销权重）
+    cohorts = []
+
+    def add_cohort(face, m):
+        if face <= 1e-6:
+            return
+        c = co_of(m)
+        cohorts.append({"face": face, "paid": 0.0, "co": 0.0, "born": m,
+                        "w": loss_weights(c, m)})
+
+    add_cohort(pool.balance, 1)
 
     rows = []
-    defaults = []
-    bal = pool.balance
+    pending = []              # (发生月, 核销额)，用于计算滞后回收
     cum_co = 0.0
-    cum_purchased = 0.0          # 持续购买累计本金，累计违约率分母的组成部分
+    cum_purchased = 0.0       # 持续购买累计本金，累计违约率分母的组成部分
+    cum_gross_principal = 0.0
+    cum_recovery = 0.0
+    first_amort_month = rev + 1
     m = 1
+    end = rev + pool.amort_months + 24
 
-    # ---------- 循环购买期 ----------
-    while m <= rev and bal > 1.0:
-        interest = bal * rm
-        charge_off = charge_off_of(m, bal)
-        recovery = sum(a for (mm, a) in defaults if m - mm == lag) * rec_rate
-        fee = bal * pool.servicing_fee_rate / 12.0
+    while m <= end:
+        interest = 0.0
+        sched = 0.0            # 计划本金回收
+        co = 0.0
+        live = 0.0
 
-        cum_co += charge_off
-        if charge_off > 0:
-            defaults.append((m, charge_off))
+        c_m = co_of(m)
+        for c in cohorts:
+            rem = c["face"] - c["paid"] - c["co"]
+            if rem <= 1e-6:
+                continue
+            live += rem
+            interest += rem * rm_of(m)
+            age = m - c["born"] + 1
+            w = c["w"][age - 1] if 0 < age <= len(c["w"]) else 0.0
+            p = c["face"] * mrr
+            d = c["face"] * c_m * w
+            if p + d > rem:
+                s = rem / (p + d)
+                p *= s
+                d *= s
+            c["paid"] += p
+            c["co"] += d
+            sched += p
+            co += d
 
-        # 本金回收（含核销）按购买率再投资，余额不变
-        principal_recovered = principal_of(bal) + charge_off
-        reinvested = principal_recovered * pool.reinvest_rate
-        principal_to_trust = principal_recovered - reinvested
-        cum_purchased += reinvested
+        recovery = sum(a for (mm, a) in pending if m - mm == lag) * rec_rate
+        pending = [(mm, a) for (mm, a) in pending if m - mm != lag]
+        if co > 0:
+            pending.append((m, co))
+
+        fee = live * pool.servicing_fee_rate / 12.0
+        tax = interest * pool.tax_rate
+
+        purchase = 0.0
+        if m <= rev:
+            # 现金守恒：可用于购买的上限是本金分账户余额（累计到账本金 − 累计已购买）
+            cash = cum_gross_principal + cum_recovery + sched + recovery - cum_purchased
+            purchase = min(reinvest * (sched + recovery), max(cash, 0.0))
+            cum_purchased += purchase
+
+        cum_co += co
+        cum_gross_principal += sched
+        cum_recovery += recovery
+
+        phase = "revolving" if m <= rev else ("amortizing" if live > 1e-6 else "tail")
+        net_principal = sched + recovery - purchase
+        # 鼎柚：摊还期第一个支付日只付息不还本（联合资信报告 p.6、p.13）
+        distribute = not (pool.revolving_first_pay_interest_only and m == first_amort_month)
 
         rows.append({
             "month": m,
-            "phase": "revolving",
-            "bal_begin": bal,
+            "phase": phase,
+            "bal_begin": live,
             "interest": interest,
-            "principal": principal_to_trust,
-            "charge_off": charge_off,
+            "principal": net_principal,
+            "gross_principal": sched,
             "recovery": recovery,
+            "purchase": purchase,
+            "charge_off": co,
             "servicing_fee": fee,
-            "total_collection": interest + principal_to_trust + recovery,
-            "bal_end": bal - principal_to_trust - charge_off * (1 - pool.reinvest_rate),
+            "tax": tax,
+            "total_collection": interest + net_principal,
+            "bal_end": live - sched - co + purchase,
+            "distribute_principal": distribute,
             "cum_charge_off_rate": cum_co / pool.balance,
             "cum_purchased": cum_purchased,
             "cum_default_rate": cum_co / (pool.balance + cum_purchased),
         })
-        bal = rows[-1]["bal_end"]
-        if bal < 1.0:
-            bal = pool.balance if pool.reinvest_rate >= 1.0 else bal
+
+        if m > rev and live <= 1e-6 and not pending:
+            break
+        if m > rev and live <= 1e-6:
+            # 余额归零但仍有未到期回收款，继续把回收款记入
+            if m >= (pending[-1][0] + lag if pending else m):
+                break
+
+        if purchase > 0:
+            add_cohort(purchase, m + 1)
         m += 1
 
-    # ---------- 摊还期 ----------
-    end = rev + pool.amort_months + 2
-    while bal > 1.0 and m <= end:
-        interest = bal * rm
-        principal = principal_of(bal)
-        charge_off = charge_off_of(m, bal)
-        if principal + charge_off > bal:
-            scale = bal / (principal + charge_off)
-            principal *= scale
-            charge_off *= scale
-        recovery = sum(a for (mm, a) in defaults if m - mm == lag) * rec_rate
-        fee = bal * pool.servicing_fee_rate / 12.0
-
-        cum_co += charge_off
-        if charge_off > 0:
-            defaults.append((m, charge_off))
-
-        rows.append({
-            "month": m,
-            "phase": "amortizing",
-            "bal_begin": bal,
-            "interest": interest,
-            "principal": principal,
-            "charge_off": charge_off,
-            "recovery": recovery,
-            "servicing_fee": fee,
-            "total_collection": interest + principal + recovery,
-            "bal_end": bal - principal - charge_off,
-            "cum_charge_off_rate": cum_co / pool.balance,
-            "cum_purchased": cum_purchased,
-            "cum_default_rate": cum_co / (pool.balance + cum_purchased),
-        })
-        bal = rows[-1]["bal_end"]
-        m += 1
-
-    # 余额归零后，仍在回收期内的月份继续入账
-    last_def = defaults[-1][0] if defaults else 0
-    while m <= last_def + lag:
-        recovery = sum(a for (mm, a) in defaults if m - mm == lag) * rec_rate
+    # 余额归零后仍在回收期内的月份继续入账
+    last_def = pending[-1][0] if pending else 0
+    while m <= last_def + lag and m <= end:
+        recovery = sum(a for (mm, a) in pending if m - mm == lag) * rec_rate
+        pending = [(mm, a) for (mm, a) in pending if m - mm != lag]
+        cum_recovery += recovery
         rows.append({
             "month": m,
             "phase": "tail",
             "bal_begin": 0.0,
             "interest": 0.0,
-            "principal": 0.0,
-            "charge_off": 0.0,
+            "principal": recovery,
+            "gross_principal": 0.0,
             "recovery": recovery,
+            "purchase": 0.0,
+            "charge_off": 0.0,
             "servicing_fee": 0.0,
+            "tax": 0.0,
             "total_collection": recovery,
             "bal_end": 0.0,
+            "distribute_principal": True,
             "cum_charge_off_rate": cum_co / pool.balance,
             "cum_purchased": cum_purchased,
             "cum_default_rate": cum_co / (pool.balance + cum_purchased),
@@ -220,9 +256,10 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, co_amounts=None,
 def summarize_pool(rows, pool):
     gross_co = sum(r["charge_off"] for r in rows)
     recovery = sum(r["recovery"] for r in rows)
-    principal = sum(r["principal"] for r in rows)
+    principal = sum(r["gross_principal"] for r in rows)
     interest = sum(r["interest"] for r in rows)
-    wal = sum(r["month"] / 12.0 * (r["principal"] + r["charge_off"]) for r in rows) / pool.balance
+    purchased = sum(r["purchase"] for r in rows)
+    wal = sum(r["month"] / 12.0 * r["gross_principal"] for r in rows) / pool.balance
     return {
         "资产池加权平均期限(年)": wal,
         "累计核销率": gross_co / pool.balance,
@@ -231,4 +268,8 @@ def summarize_pool(rows, pool):
         "本金回收率": principal / pool.balance,
         "池利息收入(亿元)": interest / 1e8,
         "存续月数": len(rows),
+        "累计放款倍数": (pool.balance + purchased) / pool.balance,
+        "累计持续购买(亿元)": purchased / 1e8,
+        "累计回收本金(亿元)": (principal + recovery) / 1e8,
+        "净损失(亿元)": (gross_co - recovery) / 1e8,
     }

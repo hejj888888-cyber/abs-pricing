@@ -98,9 +98,16 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
     fired = set(pre_fired or ())
 
     for row in rows:
-        avail = row["total_collection"] - row["servicing_fee"]
+        avail = row["total_collection"] - row["servicing_fee"] - row.get("tax", 0.0)
         if avail < 0:
             avail = 0.0
+
+        # 循环购买期留存于本金账户的资金，进入摊还期后并入可分配资金，参与正常分配
+        # （先付息、再按顺序过手还本）。早期版本把它一路留到期末、只留给次级，
+        # 结果优先档还没还清，钱却卡在账户里——AAAsf 情景下鼎柚因此少还了 2.69 亿。
+        if row["phase"] != "revolving" and reserve > 0:
+            avail += reserve
+            reserve = 0.0
 
         for n in names:
             pr[n].append(0.0)
@@ -129,6 +136,10 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
 
         # 2) 本金。循环购买期不分配本金（见模块顶部说明）。
         if row["phase"] == "revolving":
+            pass
+        elif not row.get("distribute_principal", True):
+            # 鼎柚：摊还期第一个支付日只付息不还本（联合资信报告 p.6、p.13）。
+            # 本金回收款留存在信托账户，下一期起正常过手，不再凭空消失。
             pass
         elif pay_mode == "sequential" or accelerated:
             for t in tranches:
