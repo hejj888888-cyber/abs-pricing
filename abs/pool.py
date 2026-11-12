@@ -38,6 +38,35 @@
 把同一笔核销的回收款按核销后月序 k=0,1,2,... 铺开，用于敏感性分析。
 
 任何非默认分布都是**自己引入的、原件没有的假设**，不得写成披露值。
+
+## 可购买资金的口径（第 6 周新增，`purchase_base`）
+
+评级方法 p.6 把购买率定义为：
+
+    购买率 = 当月新增资产规模 / **上月可用于购买的资金**
+
+「上月可用于购买的资金」不只是当月本金回收。鼎柚说明书 p.48 写明，持续购买期内
+本金分账户的资金来源包括《信托合同》11.5.1 的 (i)、(k)、(m) 三项，其中
+
+    (m)「收入分账户」项下剩余资金记入「本金分账户」
+
+同页还写「持续购买后的剩余资金（如有）将留存于『本金分账户』……在**下一期**持续
+购买新的资产」——即未用完的部分会滚入下一期。
+
+因此有两种口径：
+
+    principal   当期本金回收 + 当期回收款，再乘购买率（**旧口径，默认**）
+                —— 只看当期流量，忽略收入账户转入与上期留存
+    available   本金分账户余额（含上期留存）+ 当期本金回收 + 当期回收款
+                + 收入账户剩余转入，再乘购买率
+                —— 与 p.6 的「可用于购买的资金」字面一致
+
+两种口径给出的累计购买额差别很大，而公开披露只给了购买率的**数值**、没给它的
+**分母**。哪一种是评级机构实际用的，无法从公开文件判定，故保留双口径并做对照
+（见报告「二之四」节），默认值不擅自更改。
+
+`security_cost_rate` 只在 available 口径下用到：算收入账户剩余时要先扣掉证券利息，
+它等于「各档加权票面 × 证券总额 ÷ 资产池余额」。
 """
 
 from dataclasses import dataclass
@@ -60,6 +89,8 @@ class Pool:
     revolving_first_pay_interest_only: bool = False  # 摊还期首个支付日只付息不还本
     yield_ramp_months: int = -1    # 收益率加压过渡月数；-1 表示与 ramp_months 相同
     recovery_distribution: tuple = ()  # 回收按月分布权重；空 = 用 recovery_lag_months 定点滞后
+    purchase_base: str = "principal"   # 可购买资金口径：principal / available（见下）
+    security_cost_rate: float = 0.0    # 证券利息成本（年化，按资产池月初余额计），仅 available 模式用
 
     @classmethod
     def from_dict(cls, d):
@@ -81,6 +112,8 @@ class Pool:
             yield_ramp_months=int(d.get("yield_ramp_months", -1)),
             recovery_distribution=tuple(
                 float(x) for x in (d.get("recovery_distribution") or [])),
+            purchase_base=str(d.get("purchase_base", "principal")),
+            security_cost_rate=float(d.get("security_cost_rate", 0.0)),
         )
 
     def monthly_rate(self):

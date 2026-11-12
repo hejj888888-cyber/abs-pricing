@@ -79,6 +79,13 @@ def run_scenario(pool, tranches, structure, sc, vintage=None, terms=None,
         tr_s = [_replace(t, coupon=t.coupon + bps) if t.mode != "residual" else t
                 for t in tranches]
 
+    # 证券利息成本：算「收入分账户剩余」时要先扣掉它。
+    # face_i = share_i × 资产池余额，故 Σ(coupon_i × share_i) 就是按资产池计的
+    # 年化证券利息率，与资产池规模无关，可以直接作为池参数传下去。
+    from dataclasses import replace as _replace2
+    sec_cost = sum(t.coupon * t.share for t in tr_s if t.mode != "residual")
+    pool_s = _replace2(pool_s, security_cost_rate=sec_cost)
+
     rows = build_schedule(pool_s, **kw)
     result = run_waterfall(rows, pool_s.balance, tr_s, pay_mode, trigger_cdr, terms)
     cap = None
@@ -255,6 +262,66 @@ def benchmark_section(case, pool, tranches, results, summaries):
              "算术上必然得到披露的各档实付金额——上面这行勾稽在两单都精确成立，"
              "说明本模型的瀑布顺序、税费计提、次级期间收益封顶与真实结构一致。"
              "剩下的一切偏差都来自流入端，也就是资产模型。\n")
+    return L
+
+
+def purchase_calibration(case, pool, tranches):
+    """购买资金口径对照（第 6 周）。
+
+    评级方法 p.6 只给了购买率的**分子分母文字**（当月新增资产 / 上月可用于购买
+    的资金）、没给评级机构实际用的口径，而说明书里「收入账户剩余转入本金账户」
+    的条款在两单都存在。故把两种口径都跑一遍，看哪一种能复现披露的持续购买支出。
+    不做择一美化：两种口径的偏差都列出来。
+    """
+    bm = case.get("rating_benchmark") or {}
+    disc = bm.get("aaa_inflow_wan") or {}
+    if not disc.get("持续购买支出"):
+        return []
+    idx = next((i for i, s in enumerate(case["scenarios"]) if s["id"] == "aaa"), -1)
+    if idx < 0:
+        return []
+    sc = case["scenarios"][idx]
+    structure = case.get("structure", {})
+    vintage = vintage_from_dict(case.get("vintage"))
+    terms = TriggerTerms.from_dict(case.get("triggers"))
+
+    # 披露口径的净损失 = 累计投放本金 − 回收款本金
+    disc_net = (wan(pool.balance) + disc["持续购买支出"] - disc["回收款本金"])
+
+    from dataclasses import replace as _r
+    rows_out = []
+    for mode, label in (("principal", "只算当期本金回收（旧口径）"),
+                        ("available", "含收入账户转入＋上期留存（p.6 字面口径）")):
+        rr = run_scenario(_r(pool, purchase_base=mode), tranches, structure, sc,
+                          vintage, terms, stop_revolving=False)
+        buy = wan(sum(r["purchase"] for r in rr[0]))
+        net = wan(sum(r["charge_off"] - r["recovery"] for r in rr[0]))
+        rows_out.append([
+            label,
+            "{:,.0f}".format(buy),
+            "{:+.1f}%".format((buy - disc["持续购买支出"]) / disc["持续购买支出"] * 100),
+            "{:,.0f}".format(net),
+            "{:+.1f}%".format((net - disc_net) / disc_net * 100),
+        ])
+
+    L = ["\n## 二之四、购买资金口径：两种读法差多少（第 6 周）\n"]
+    L.append("评级方法 p.6 把购买率写成「当月新增资产规模 / **上月可用于购买的资金**」，"
+             "但公开文件没有说明「可用于购买的资金」具体含哪些科目。本单说明书对这一点"
+             "有明确条款（见下），据此可以构造出两种口径：\n")
+    L.append("| 口径 | 购买基数 |")
+    L.append("|---|---|")
+    L.append("| `principal`（默认） | 当期本金回收 + 当期核销回收 |")
+    L.append("| `available` | 本金分账户余额（含上期留存）+ 当期本金回收 + 当期回收款"
+             " + 收入分账户剩余转入 |")
+    L.append("")
+    L.append(md_table(["口径", "累计购买（万元）", "对披露偏差", "净损失（万元）", "对披露偏差"],
+                      rows_out))
+    L.append("> 披露的持续购买支出 {:,.2f} 万元、净损失 {:,.2f} 万元（= 累计投放 − 回收款本金）。".format(
+        disc["持续购买支出"], disc_net))
+    L.append("")
+    clause = bm.get("purchase_clause")
+    if clause:
+        L.append("**本单条款原文**：{}\n".format(clause))
     return L
 
 
@@ -561,6 +628,7 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
 
     L.extend(benchmark_section(case, pool, tranches, results, summaries))
     L.extend(recovery_section(case, pool, tranches))
+    L.extend(purchase_calibration(case, pool, tranches))
 
     L.append("\n## 三、分层结果（基准情景）\n")
     headers = ["档位", "评级", "发行规模(亿元)", "占比", "票面利率", "目标收益率", "实现收益率",

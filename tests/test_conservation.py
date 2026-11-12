@@ -98,5 +98,59 @@ class TestQueueFullyAmortizes(unittest.TestCase):
         self.assertAlmostEqual(principal + loss, p.balance, delta=p.balance * 1e-9)
 
 
+class TestPurchaseBase(unittest.TestCase):
+    """购买资金口径（第 6 周）：principal vs available。
+
+    依据：评级方法 p.6「购买率 = 当月新增资产 / 上月可用于购买的资金」；两单说明书
+    都写明持续购买期内「收入账户剩余转入本金账户」，且未用完的留存滚入下一期。
+    见 `docs/purchase-base.md`。
+    """
+
+    def test_available_is_not_smaller(self):
+        """含收入转入与留存的口径，累计购买不可能更少。"""
+        base = make_pool(revolving_months=6, reinvest_rate=0.5,
+                         security_cost_rate=0.02)
+        from dataclasses import replace
+        a = build_schedule(replace(base, purchase_base="principal"))
+        b = build_schedule(replace(base, purchase_base="available"))
+        buy_a = sum(r["purchase"] for r in a)
+        buy_b = sum(r["purchase"] for r in b)
+        self.assertGreaterEqual(buy_b, buy_a - 1.0)
+        self.assertGreater(buy_b, 0.0)
+
+    def test_available_keeps_loss_conservation(self):
+        """换口径不能破坏守恒：累计核销仍等于 co_final × 累计放款。"""
+        p = make_pool(revolving_months=6, reinvest_rate=0.6,
+                      security_cost_rate=0.02, purchase_base="available")
+        rows = build_schedule(p, co_mult=2.0, ramp_months=4)
+        purchased = sum(r["purchase"] for r in rows)
+        expected = 0.05 * 2.0 * (p.balance + purchased)
+        self.assertAlmostEqual(cum_charge_off(rows), expected, delta=expected * 1e-9)
+
+    def test_income_transfer_only_counts_remainder(self):
+        """收入账户转入 = 利息 − 服务费 − 税费 − 证券利息，不能为负。"""
+        p = make_pool(revolving_months=6, reinvest_rate=0.0,
+                      security_cost_rate=0.02, purchase_base="available")
+        rows = build_schedule(p)
+        for r in rows:
+            if r["phase"] != "revolving":
+                continue
+            cost = r["servicing_fee"] + r["tax"] + r["bal_begin"] * 0.02 / 12.0
+            self.assertGreaterEqual(r["income_transfer"], 0.0)
+            self.assertAlmostEqual(r["income_transfer"],
+                                   max(r["interest"] - cost, 0.0),
+                                   delta=max(r["interest"], 1.0) * 1e-9)
+
+    def test_first_amort_month_defers_principal(self):
+        """摊还期首个只付息日不分本金，回款留存在本金分账户、次月一并过手。"""
+        p = make_pool(revolving_months=4, reinvest_rate=0.6,
+                      revolving_first_pay_interest_only=True)
+        rows = build_schedule(p)
+        first_amort = next(r for r in rows if r["phase"] == "amortizing")
+        self.assertEqual(first_amort["principal"], 0.0)
+        self.assertGreater(first_amort["prin_acct"], 0.0)
+        self.assertGreater(rows[first_amort["month"]]["principal"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

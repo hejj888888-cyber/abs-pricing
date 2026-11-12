@@ -220,6 +220,7 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
     recovery_events = {}      # 到期月 -> 当月应到账的回收额（已乘 rec_rate）
     cum_co = 0.0
     cum_purchased = 0.0       # 持续购买累计本金，累计违约率分母的组成部分
+    prin_acct = 0.0           # 本金分账户余额（跨月结转）
     cum_gross_principal = 0.0
     cum_recovery = 0.0
     first_amort_month = rev + 1
@@ -269,21 +270,56 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
         fee = live * pool.servicing_fee_rate / 12.0
         tax = interest * pool.tax_rate
 
+        # ---- 持续购买的可用资金（第 6 周按说明书 p.48 重写）----
+        # 本金分账户是一个显式余额，跨月结转：
+        #   principal 口径：只把当期本金回收 + 回收款当作购买基数
+        #   available 口径：再加上「收入分账户剩余转入」（11.5.1(m)），
+        #                    以及上期留存在本金分账户的余额（p.48「下一期持续购买」）
+        #
+        # 摊还期的第一件事是把「什么时候能分本金」定下来：
+        # 鼎柚：摊还期第一个支付日只付息不还本（联合资信报告 p.6、p.13）。
+        # 那一期收到的本金不能丢，必须留在本金分账户、下一期起一并过手，
+        # 否则会被瀑布当成「未分配余额」流向次级——方向刚好相反。
+        distribute = not (pool.revolving_first_pay_interest_only
+                          and m == first_amort_month)
+
         purchase = 0.0
+        income_transfer = 0.0
+        topup = 0.0
+        sweep = 0.0
+        net_principal = 0.0
         if m <= rev:
-            # 现金守恒：可用于购买的上限是本金分账户余额（累计到账本金 − 累计已购买）
-            cash = cum_gross_principal + cum_recovery + sched + recovery - cum_purchased
-            purchase = min(reinvest * (sched + recovery), max(cash, 0.0))
+            if pool.purchase_base == "available":
+                cost = live * pool.security_cost_rate / 12.0
+                # 收入账户先付税费、服务费、证券利息；不足由本金账户补足，剩余转出
+                income_transfer = max(interest - fee - tax - cost, 0.0)
+                topup = max(fee + tax + cost - interest, 0.0)
+                available = max(prin_acct + sched + recovery
+                                + income_transfer - topup, 0.0)
+                purchase = min(reinvest * available, available)
+            else:
+                available = max(prin_acct + sched + recovery, 0.0)
+                purchase = min(reinvest * (sched + recovery), available)
             cum_purchased += purchase
+            prin_acct = available - purchase
+            net_principal = 0.0        # 循环期不分本金，全部留存或再投资
+        else:
+            # 摊还期不再购买。未到可分配本金的月份，回款与存量现金继续留在
+            # 本金分账户；可分配月份一次性清扫（压力情景下购买率不足 100% 时
+            # 累积的现金，早期版本在这里凭空消失，是漏损）。
+            prin_acct += sched + recovery
+            if distribute:
+                sweep = prin_acct
+                net_principal = prin_acct
+                prin_acct = 0.0
+            else:
+                net_principal = 0.0
 
         cum_co += co
         cum_gross_principal += sched
         cum_recovery += recovery
 
         phase = "revolving" if m <= rev else ("amortizing" if live > 1e-6 else "tail")
-        net_principal = sched + recovery - purchase
-        # 鼎柚：摊还期第一个支付日只付息不还本（联合资信报告 p.6、p.13）
-        distribute = not (pool.revolving_first_pay_interest_only and m == first_amort_month)
 
         rows.append({
             "month": m,
@@ -297,6 +333,10 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
             "charge_off": co,
             "servicing_fee": fee,
             "tax": tax,
+            "income_transfer": income_transfer,   # 收入分账户剩余转入本金分账户
+            "prin_topup": topup,                  # 本金分账户补足收入分账户缺口
+            "prin_sweep": sweep,                  # 摊还期初始清扫的留存现金
+            "prin_acct": prin_acct,               # 月末本金分账户余额
             "total_collection": interest + net_principal,
             "bal_end": live - sched - co + purchase,
             "distribute_principal": distribute,
