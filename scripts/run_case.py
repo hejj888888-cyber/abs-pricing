@@ -325,6 +325,68 @@ def purchase_calibration(case, pool, tranches):
     return L
 
 
+def servicer_section(case, pool, tranches):
+    """服务机构替换：触发链条复现（第 7 周，原计划第 4 周的剩余项）。
+
+    两单的条款不一样，不能用同一套：
+      鼎柚 (129)(b)「贷款服务机构解任事件」—— 独立条件，发生时即构成加速清偿，无宽限；
+      鼎柚 (129)(d)「需更换……但 90 日内仍无法找到合格继任者」—— 有 90 日链条；
+      够花 (130)(b) 同为解任事件；(130)(c) 是「未在规定时间内任命后备服务机构」，无缓冲。
+
+    本节只把「事件何时发生、后果何时兑现」这条链路跑出来，不做参数敏感性——
+    因为服务费率仅 0.01%，替换本身对现金流的直接影响接近于零；真正有量级的是
+    混同风险（回收款划转链条断掉），那是第 5 周的事。
+    """
+    terms0 = TriggerTerms.from_dict(case.get("triggers"))
+    if terms0 is None:
+        return []
+    structure = case.get("structure", {})
+    vintage = vintage_from_dict(case.get("vintage"))
+    base = next((s for s in case["scenarios"] if s.get("id") == "base"),
+                case["scenarios"][0])
+    grace = int(getattr(terms0, "servicer_grace_months", 3))
+
+    variants = [
+        ("不注入（基准）", {}),
+        ("第 3 月发生解任事件（无宽限）", {"SERVICER_DEFAULT": 3}),
+        ("第 3 月起需更换、宽限 {} 个月".format(grace),
+         {"SERVICER_REPLACEMENT_REQUIRED": 3}),
+    ]
+
+    rows_out = []
+    for label, flags in variants:
+        t = TriggerTerms(**{**terms0.__dict__, "flags": dict(flags)})
+        rr = run_scenario(pool, tranches, structure, base, vintage, t)
+        evs = [e for e in rr[1].trigger_events if e.code.startswith("SERVICER")]
+        cap = rr[1].revolving_cap
+        a_paid = wan(sum(rr[1].cashflow.get("优先A", [0.0])))
+        rows_out.append([
+            label,
+            "第 {} 月".format(evs[0].month) if evs else "未触发",
+            "—" if cap is None else "第 {} 月".format(cap),
+            "{:,.0f}".format(wan(sum(r["purchase"] for r in rr[0]))),
+            "{:,.0f}".format(a_paid),
+        ])
+
+    L = ["\n## 七之二、服务机构替换：触发链条复现（第 7 周）\n"]
+    L.append("> 数据源：鼎柚发行说明书 (129) 加速清偿事件 (b)(c)(d)、够花 (130) (b)(c)。"
+             "两单条款结构不同，宽限月数按各自原文设定。\n")
+    L.append(md_table(["情景", "触发时点", "循环期截断至", "累计购买（万元）", "优先A 本息合计（万元）"],
+                      rows_out))
+    note = case.get("triggers", {}).get("servicer_grace_note")
+    if note:
+        L.append("\n**本单口径**：{}\n".format(note))
+    L.append("")
+    L.append("**怎么读**：真正被改变的是**循环期长度**，不是分配。加速清偿一旦触发，"
+             "持续购买立即终止，累计购买从基准的量级掉到表里那个数——这是这条条款的"
+             "全部实质后果。优先A 的本息合计几乎不动（顺序偿付 + 超额利差保护下它始终"
+             "足额受偿），说明**这条条款对优先档不是信用风险，是规模风险**。\n")
+    L.append("> 注：服务费率仅 0.01%，「换一家服务机构」本身的费用差异可以忽略；"
+             "它的真实杀伤力在混同风险——回收款还在原服务机构账上、划转链条中断，"
+             "那是另一条链路（第 5 周）。这里不拿一个「不敏感」的结论冒充实测通过。\n")
+    return L
+
+
 def recovery_section(case, pool, tranches):
     """回收时间分布敏感性（原计划第 3 周）。
 
@@ -770,6 +832,8 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
         L.append("\n不加速相对加速多亏的净损失率：{}。加速清偿的作用不是「让优先档不亏」，"
                  "而是**在损失继续累积之前把资产池关掉**——循环期越短，同一笔本金重复暴露于违约的次数越少，"
                  "因此累计核销率下降，优先档的受偿来源也随之提前锁定。\n".format("；".join(gain)))
+
+    L.extend(servicer_section(case, pool, tranches))
 
     L.append("\n## 八、假设与局限\n")
     L.append("1. 循环购买期与摊还期长度披露文件中未直接给出，按「持续购买终止日」与优先档预期到期日倒推（见第一节来源列）。")

@@ -191,5 +191,46 @@ class TestWaterfallIntegration(unittest.TestCase):
         self.assertGreater(res.accel_month, 0)
 
 
+class TestServicerChain(unittest.TestCase):
+    """服务机构替换是一个链条，不是时点（第 7 周）。
+
+    鼎柚 (129)(d)：「需要更换……但 90 日内仍无法找到合格的继任者」才构成加速清偿；
+    够花 (130)(c)：「未在规定时间内任命后备贷款服务机构」，无缓冲。
+    """
+
+    def run_month(self, m, t):
+        return evaluate_month(m, 0.0, {}, [], t, set())
+
+    def test_grace_defers_trigger(self):
+        """宽限 3 个月：第 3 月提出更换，第 5 月还不能触发，第 6 月才触发。"""
+        t = terms(flags={"SERVICER_REPLACEMENT_REQUIRED": 3}, servicer_grace_months=3)
+        for m in (3, 4, 5):
+            codes = [e.code for e in self.run_month(m, t)]
+            self.assertNotIn("SERVICER_REPLACEMENT_FAILED", codes, f"第 {m} 月不该触发")
+        codes = [e.code for e in self.run_month(6, t)]
+        self.assertIn("SERVICER_REPLACEMENT_FAILED", codes)
+
+    def test_zero_grace_fires_same_month(self):
+        """够花：宽限 0，提出当月即触发。"""
+        t = terms(flags={"SERVICER_REPLACEMENT_REQUIRED": 3}, servicer_grace_months=0)
+        self.assertNotIn("SERVICER_REPLACEMENT_FAILED",
+                         [e.code for e in self.run_month(2, t)])
+        self.assertIn("SERVICER_REPLACEMENT_FAILED",
+                      [e.code for e in self.run_month(3, t)])
+
+    def test_required_flag_alone_is_not_a_condition(self):
+        """「需要更换」本身不是条件代号，不能自己变成一条触发记录。"""
+        t = terms(flags={"SERVICER_REPLACEMENT_REQUIRED": 1}, servicer_grace_months=3)
+        codes = [e.code for e in self.run_month(1, t)]
+        self.assertEqual(codes, [])
+
+    def test_default_is_immediate_and_kind_is_accel(self):
+        """解任事件本身无宽限，且后果分类是加速清偿（不是违约事件）。"""
+        t = terms(flags={"SERVICER_DEFAULT": 3}, servicer_grace_months=3)
+        evs = self.run_month(3, t)
+        self.assertEqual([e.code for e in evs], ["SERVICER_DEFAULT"])
+        self.assertEqual(evs[0].kind, "accel")
+
+
 if __name__ == "__main__":
     unittest.main()

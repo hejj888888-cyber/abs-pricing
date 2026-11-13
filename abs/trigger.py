@@ -103,6 +103,7 @@ class TriggerTerms:
     first_year_months: int = 12
     default_uplift: float = 1.0         # 累计违约率 = 累计核销率 × 该系数（假设）
     flags: dict = field(default_factory=dict)   # {code: month}，情景开关
+    servicer_grace_months: int = 3      # 「需更换但未任命继任者」的宽限月数（90 日 ≈ 3 个月）
     principal_overdue_enabled: bool = False     # 见模块说明
     enabled: bool = True
 
@@ -123,6 +124,7 @@ class TriggerTerms:
             first_year_months=int(d.get("first_year_months", 12)),
             default_uplift=float(d.get("default_uplift", 1.0)),
             flags=dict(d.get("flags", {})),
+            servicer_grace_months=int(d.get("servicer_grace_months", 3)),
             principal_overdue_enabled=bool(d.get("principal_overdue_enabled", False)),
             enabled=True,
         )
@@ -135,6 +137,7 @@ CONDITION_LABELS = {
     "SENIOR_PRINCIPAL_OVERDUE": "优先档本金未按期足额分配",
     "SERVICER_DEFAULT": "贷款服务机构解任事件",
     "SERVICER_FAILURE": "后备贷款服务机构缺位",
+    "SERVICER_REPLACEMENT_FAILED": "需更换服务机构但未能在宽限期内任命继任者",
     "SPONSOR_INSOLVENCY": "发起机构/委托人丧失清偿能力",
     "DOC_TERMINATION": "交易文件终止、无效或不可主张权利",
 }
@@ -148,6 +151,7 @@ CONDITION_KINDS = {
     "SENIOR_PRINCIPAL_OVERDUE": "accel",
     "SERVICER_DEFAULT": "accel",
     "SERVICER_FAILURE": "accel",
+    "SERVICER_REPLACEMENT_FAILED": "accel",
     "SPONSOR_INSOLVENCY": "accel",
     "SENIOR_INTEREST_SHORTFALL": "eod",        # 说明书：支付日后 5 个工作日未付 → 违约事件
     "DOC_TERMINATION": "declare",
@@ -202,6 +206,20 @@ def evaluate_month(month, cum_charge_off_rate, senior_unpaid_interest,
     if overdue_principal_tranches:
         add("SENIOR_PRINCIPAL_OVERDUE",
             "已过预期到期月仍有余额：" + "、".join(overdue_principal_tranches))
+
+    # 服务机构替换是一个**链条**，不是时点事件：
+    #   鼎柚 (129)(d)：需要更换受托人/贷款服务机构/必须任命后备机构，**但 90 日内仍无法
+    #   找到合格继任者**，才构成加速清偿事件。
+    #   够花 (130)(c)：是「未在规定时间内任命后备贷款服务机构」，没有 90 日缓冲，
+    #   故该单 servicer_grace_months = 0，结果仍在同一到期月触发。
+    # 把「需要更换」当作驱动事件（本身不是条件，只是起点），到 m + 宽限月才触发。
+    req = terms.flags.get("SERVICER_REPLACEMENT_REQUIRED")
+    if req is not None:
+        due = int(req) + int(terms.servicer_grace_months)
+        if month >= due:
+            add("SERVICER_REPLACEMENT_FAILED",
+                "第 {} 月起需更换贷款服务机构，宽限 {} 个月（至第 {} 月）仍无合格继任者".format(
+                    int(req), int(terms.servicer_grace_months), due))
 
     for code, m in terms.flags.items():
         if code in CONDITION_LABELS and month >= int(m):
