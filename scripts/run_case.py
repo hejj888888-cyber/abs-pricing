@@ -631,14 +631,15 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
         purch_full = sum(r["purchase"] for r in _full[0])
 
         if peak > thr:
-            L.append("\n### 累计违约率阈值会被突破——但披露结果不支持这个触发\n")
+            L.append("\n### 累计违约率阈值会被突破——披露值更接近「未叠加触发」口径\n")
             L.append("按合同口径，本单各情景的累计违约率峰值 **{}**，首年阈值 {}，"
                      "**压力情景下会触发**加速清偿。\n".format(pct(peak), pct(thr, 0)))
             L.append("这个结论与上一版相反，原因是核销率口径修正：核销率由年化改为"
                      "**累计终身**口径后，累计违约本金约放大一倍，分母虽然被持续购买"
                      "稀释，仍不足以压到 5% 之下。\n")
-            L.append("**但评级机构披露的压力测试结果并不支持这个触发。** 图表20/21 给出的"
-                     "持续购买支出是在**完整循环期**下跑出来的；本模型一旦把加速清偿"
+            L.append("**但披露的持续购买支出量级更接近「未叠加触发反馈」的口径。** "
+                     "图表20/21 给出的持续购买支出是在**接近完整循环期**下跑出来的；"
+                     "本模型一旦把加速清偿"
                      "反馈进现金流（循环期截断到触发前一月），购买额由 {:,.0f} 万元掉到 "
                      "{:,.0f} 万元，循环期被砍掉 {} 个月。\n".format(
                          wan(purch_full), wan(purch_trunc),
@@ -785,7 +786,9 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
             elif code == "SENIOR_INTEREST_SHORTFALL":
                 how = "模型判定（取瀑布欠付利息余额）"
             elif code == "SENIOR_PRINCIPAL_OVERDUE":
-                how = "实现但默认关闭（模型清偿月与披露预期到期日有 1–2 个月偏差，会误报）"
+                how = ("模型判定（鼎柚(129)(f) 逐单开启）"
+                       if tr.get("principal_overdue_enabled", False) else
+                       "实现但本单不启用（模型清偿月与披露预期到期日有 1–2 个月偏差，会误报）")
             else:
                 how = "情景开关（{}）".format(
                     "已注入" if code in (tr.get("flags") or {}) else "未注入")
