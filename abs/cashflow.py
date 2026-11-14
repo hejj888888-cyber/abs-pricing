@@ -90,6 +90,42 @@
 与当月 `recovery`），改到账月份会改变当月购买额、队列规模、后续利息与核销，
 也就是会改变总量。这与第 2 周账龄曲线「只改时序、总量不变」不同，不能套用
 两遍跑法；分布只能作为敏感性开关，基准仍用与披露口径一致的定点滞后。
+
+## 第 7 周：账户内划转的两面记账（P0-D 修复）
+
+`available` 口径下收入分账户与本金分账户之间有两笔划转，早期版本只记了一边：
+
+1. 收入不足时 `topup` 从本金账户划给收入账户，本金账户已扣，但交给瀑布的
+   `total_collection` 没加回来——现金同时从模型流入端和证券支付端消失，瀑布
+   还会把「账上有钱却被划走」误判成优先档利息未足额偿付。
+2. 收入有剩余时 `income_transfer` 转入本金账户买了资产，但完整 `interest`
+   仍进入瀑布形成 `reserve`——同一笔剩余收入被用了两次。
+
+现在两笔划转在两个账户里同时记账：
+
+    principal_cash  = prin_acct(上期留存) + 计划本金 + 回收款
+    income_required = 服务费 + 税费 + 证券利息
+    topup           = min(max(income_required − interest, 0), principal_cash)
+    income_transfer = max(interest − income_required, 0)
+
+    购买基数        = principal_cash − topup + income_transfer
+    交给瀑布        = interest + topup − income_transfer + 分摊本金
+
+由此收入账户净额恰好等于 `income_required`（本金足够时），既不会凭空消失也不会
+重复计算；本金账户恒等式
+`principal_cash + income_transfer == topup + purchase + prin_acct(月末)` 始终成立。
+补足款受本金账户余额约束，因此本金真的不够时仍会留下**真实**的利息缺口，不再是
+账户划转造成的假缺口。
+
+`principal` 口径不启用这两条划转，`waterfall_cash` 恒等于 `interest`，故该路径
+逐行等价（见 `baseline/p0d/diff-report.md`）。
+
+`income_required` 里的证券利息按 `pool.balance × security_cost_rate / 12` 计提：
+`security_cost_rate = Σ(票面 × 分层占比)`，而各档初始本金 = 占比 × 初始资产池，
+故这个式子与瀑布按「未偿本金 × 票面」算出的应付利息精确相等。早期用当期
+`live` 近似，队列摊还后会偏小，正是修复后第 2 月冒出欠息误报的原因。
+
+仍未纳入次级期间收益（够花 p.44 不超过 3%/年），属于 P1-4，本轮未改。
 """
 
 import math
@@ -286,17 +322,33 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
         purchase = 0.0
         income_transfer = 0.0
         topup = 0.0
+        income_required = 0.0
         sweep = 0.0
         net_principal = 0.0
+        # 交给瀑布的现金。principal 口径下就是完整利息 + 本金（历史行为，逐行等价）；
+        # available 口径下是收入分账户「扣掉转出、加上补足」后的净额 + 本金。
+        waterfall_cash = interest
         if m <= rev:
             if pool.purchase_base == "available":
-                cost = live * pool.security_cost_rate / 12.0
-                # 收入账户先付税费、服务费、证券利息；不足由本金账户补足，剩余转出
-                income_transfer = max(interest - fee - tax - cost, 0.0)
-                topup = max(fee + tax + cost - interest, 0.0)
-                available = max(prin_acct + sched + recovery
-                                + income_transfer - topup, 0.0)
-                purchase = min(reinvest * available, available)
+                # 证券利息按各档「未偿本金 × 票面」计提。循环期不分本金，故证券
+                # 未偿本金恒等于初始发行规模，用 pool.balance 而非当期资产池余额
+                # live：队列摊还后 live 会小于初始池，旧近似会让交给瀑布的钱少于
+                # 应付利息，凭空产生「优先档利息欠付」误报（P0-D 修复后暴露）。
+                cost = pool.balance * pool.security_cost_rate / 12.0
+                principal_cash = max(prin_acct + sched + recovery, 0.0)
+                income_required = fee + tax + cost
+
+                # 第 7 周 P0-D 修复：账户内划转必须两边同时记账。
+                # 旧实现把 topup 从本金账户扣掉却没交给瀑布（现金凭空消失，瀑布
+                # 还会误判优先档利息欠付）；又把 income_transfer 拿去买资产的同时
+                # 让完整利息进入瀑布形成 reserve（同一笔剩余收入被使用两次）。
+                # 现在补足款受本金账户余额约束，收入账户净额原样交给瀑布。
+                topup = min(max(income_required - interest, 0.0), principal_cash)
+                income_transfer = max(interest - income_required, 0.0)
+                purchase_cash = principal_cash - topup + income_transfer
+                available = purchase_cash
+                waterfall_cash = interest + topup - income_transfer
+                purchase = min(reinvest * purchase_cash, purchase_cash)
             else:
                 available = max(prin_acct + sched + recovery, 0.0)
                 purchase = min(reinvest * (sched + recovery), available)
@@ -333,11 +385,12 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
             "charge_off": co,
             "servicing_fee": fee,
             "tax": tax,
+            "income_required": income_required,   # 收入账户应付（费+税+证券利息），仅 available 口径
             "income_transfer": income_transfer,   # 收入分账户剩余转入本金分账户
-            "prin_topup": topup,                  # 本金分账户补足收入分账户缺口
+            "prin_topup": topup,                  # 本金分账户实际补足收入分账户缺口（受余额约束）
             "prin_sweep": sweep,                  # 摊还期初始清扫的留存现金
             "prin_acct": prin_acct,               # 月末本金分账户余额
-            "total_collection": interest + net_principal,
+            "total_collection": waterfall_cash + net_principal,
             "bal_end": live - sched - co + purchase,
             "distribute_principal": distribute,
             "cum_charge_off_rate": cum_co / pool.balance,

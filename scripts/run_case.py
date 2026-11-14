@@ -82,6 +82,9 @@ def run_scenario(pool, tranches, structure, sc, vintage=None, terms=None,
     # 证券利息成本：算「收入分账户剩余」时要先扣掉它。
     # face_i = share_i × 资产池余额，故 Σ(coupon_i × share_i) 就是按资产池计的
     # 年化证券利息率，与资产池规模无关，可以直接作为池参数传下去。
+    # 现金流引擎按**初始**资产池余额计提（循环期证券未偿本金不分摊、恒等于初始
+    # 发行规模），与瀑布按「各档未偿本金 × 票面」算出的应付利息精确相等；
+    # 按当期资产池余额 live 近似会在队列摊还后误报优先档利息欠付（第 7 周 P0-D）。
     from dataclasses import replace as _replace2
     sec_cost = sum(t.coupon * t.share for t in tr_s if t.mode != "residual")
     pool_s = _replace2(pool_s, security_cost_rate=sec_cost)
@@ -319,6 +322,14 @@ def purchase_calibration(case, pool, tranches):
     L.append("> 披露的持续购买支出 {:,.2f} 万元、净损失 {:,.2f} 万元（= 累计投放 − 回收款本金）。".format(
         disc["持续购买支出"], disc_net))
     L.append("")
+    L.append("**第 7 周 P0-D 修复后的重算说明**：修复前 `available` 口径把收入账户剩余"
+             "转入拿去买资产的同时，又让完整利息进入瀑布形成留存（同一笔钱用两次），"
+             "且本金账户补足款没有交给瀑布。修复后两笔划转在两个账户里同时记账，"
+             "证券利息改按初始发行规模计提。默认 `principal` 路径逐行不变（10 组基线"
+             " diff = 0），`available` 路径的累计购买仅微调不到 0.2%——改的是分配端"
+             "与触发判定，不是购买基数；真正变化的是 `total_collection`（减少额恰等于"
+             " `Σincome_transfer`）与各档实付、期末留存。见 `docs/purchase-base.md`"
+             " 第八节与仓库同级 `baseline/p0d/diff-report.md`。\n")
     clause = bm.get("purchase_clause")
     if clause:
         L.append("**本单条款原文**：{}\n".format(clause))

@@ -65,8 +65,11 @@
 **分母**。哪一种是评级机构实际用的，无法从公开文件判定，故保留双口径并做对照
 （见报告「二之四」节），默认值不擅自更改。
 
-`security_cost_rate` 只在 available 口径下用到：算收入账户剩余时要先扣掉证券利息，
-它等于「各档加权票面 × 证券总额 ÷ 资产池余额」。
+`security_cost_rate` 只在 `available` 口径下用到：算收入账户剩余时要先扣掉证券
+利息，它等于 `Σ(各档票面 × 分层占比)`。现金流引擎按**初始资产池余额**计提
+（循环期证券未偿本金不分摊、恒等于初始发行规模），因此与瀑布按「各档未偿本金
+× 票面」算出的应付利息精确相等；早期按当期资产池余额 `live` 近似，队列摊还后
+会偏小并误报优先档利息欠付（第 7 周 P0-D 修复，见 `docs/purchase-base.md`）。
 """
 
 from dataclasses import dataclass
@@ -90,7 +93,7 @@ class Pool:
     yield_ramp_months: int = -1    # 收益率加压过渡月数；-1 表示与 ramp_months 相同
     recovery_distribution: tuple = ()  # 回收按月分布权重；空 = 用 recovery_lag_months 定点滞后
     purchase_base: str = "principal"   # 可购买资金口径：principal / available（见下）
-    security_cost_rate: float = 0.0    # 证券利息成本（年化，按资产池月初余额计），仅 available 模式用
+    security_cost_rate: float = 0.0    # 证券利息成本（年化，按初始资产池余额计提），仅 available 模式用
 
     @classmethod
     def from_dict(cls, d):
