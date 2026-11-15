@@ -64,6 +64,7 @@ class WaterfallResult:
     reserve: float = 0.0                              # 期末释放给次级的留存超额收益
     excess_servicing: float = 0.0                     # 归服务商的超额服务费（excess_sweep=True 时）
     trigger_events: list = field(default_factory=list)  # 触发事件明细（第 3 周新增）
+    sub_income: list = field(default_factory=list)      # 每月次级期间收益实付（第 8 周 P1-4）
 
 
 def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_cdr=0.06,
@@ -87,6 +88,7 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
     pr = {n: [] for n in names}
     unpaid_in = {n: 0.0 for n in names}
     reserve = 0.0
+    sub_income = []
     excess_servicing = 0.0
     accel_month = 0
     res = tranches[-1]
@@ -133,6 +135,19 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
             cf[t.name].append(pay)
 
         accelerated = accel_month != 0
+
+        # 1.5) 次级期间收益（第 8 周 P1-4）：排在优先档利息之后、本金分配之前。
+        # 条款：鼎柚 p.47(j) / p.92–93、够花 p.44(9) / p.45(1)；加速清偿或违约后
+        # 不再支付，优先档本金清偿完毕前才产生。不足额是否顺延由现金流引擎按 case
+        # 配置（`sub_income_carry`），这里只负责「当期能付多少」。
+        senior_open = any(t.mode != "residual" and balances[t.name] > 1e-6
+                          for t in tranches)
+        sub_pay = 0.0
+        if res_income_rate and not accelerated and senior_open:
+            sub_pay = min(res_income_rate * balances[res.name], avail)
+            cf[res.name][-1] += sub_pay
+            avail -= sub_pay
+        sub_income.append(sub_pay)
 
         # 2) 本金。循环购买期不分配本金（见模块顶部说明）。
         if row["phase"] == "revolving":
@@ -193,13 +208,8 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
         elif accel_month == 0 and row["cum_charge_off_rate"] > trigger_cdr:
             accel_month = row["month"]
 
-        # 4) 剩余：次级期间收益封顶，超额留存或归服务商
+        # 4) 剩余留存（次级期间收益已在上一步支付，不再重复扣）
         if avail > 1e-9:
-            if res_income_rate:
-                # 可分配资金不足时，不足部分下一期不予补足（够花说明书 p.44）
-                pay = min(res_income_rate * balances[res.name], avail)
-                cf[res.name][-1] += pay
-                avail -= pay
             reserve += avail
 
     if reserve > 0 and cf[res.name]:
@@ -218,4 +228,5 @@ def run_waterfall(rows, pool_balance, tranches, pay_mode="sequential", trigger_c
         reserve=reserve,
         excess_servicing=excess_servicing,
         trigger_events=events,
+        sub_income=sub_income,
     )

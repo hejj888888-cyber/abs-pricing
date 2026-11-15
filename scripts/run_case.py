@@ -87,7 +87,14 @@ def run_scenario(pool, tranches, structure, sc, vintage=None, terms=None,
     # 按当期资产池余额 live 近似会在队列摊还后误报优先档利息欠付（第 7 周 P0-D）。
     from dataclasses import replace as _replace2
     sec_cost = sum(t.coupon * t.share for t in tr_s if t.mode != "residual")
-    pool_s = _replace2(pool_s, security_cost_rate=sec_cost)
+    # 次级期间收益（第 8 周 P1-4）：占比与收益率从 residual 分层注入；不足额是否
+    # 顺延是交易条款，由 structure.sub_income_carry 配置（鼎柚 True、够花 False）。
+    residual = [t for t in tr_s if t.mode == "residual"]
+    pool_s = _replace2(
+        pool_s, security_cost_rate=sec_cost,
+        sub_share=residual[-1].share if residual else 0.0,
+        sub_income_rate=residual[-1].income_rate if residual else 0.0,
+        sub_income_carry=bool(structure.get("sub_income_carry", False)))
 
     rows = build_schedule(pool_s, **kw)
     result = run_waterfall(rows, pool_s.balance, tr_s, pay_mode, trigger_cdr, terms)

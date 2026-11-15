@@ -70,6 +70,20 @@
 （循环期证券未偿本金不分摊、恒等于初始发行规模），因此与瀑布按「各档未偿本金
 × 票面」算出的应付利息精确相等；早期按当期资产池余额 `live` 近似，队列摊还后
 会偏小并误报优先档利息欠付（第 7 周 P0-D 修复，见 `docs/purchase-base.md`）。
+
+## 次级期间收益（第 8 周 P1-4）
+
+两单都约定：优先档本金清偿完毕前，次级按不超过 3%/年取得期间收益；加速清偿或
+违约后不再支付。它与「收入账户剩余转入本金账户」是竞争关系——先付次级期间收益，
+剩下的才能转去购买。
+
+`sub_share` 与 `sub_income_rate` 由 `run_scenario` 从 residual 分层的
+`share` / `income_rate` 注入，故循环期内 `初始池 × sub_share` 就是次级未偿本金
+（循环期不分本金），与瀑布按 `balances[次级]` 计提的金额精确相等。
+
+`sub_income_carry` 按两单条款分别配置：鼎柚一般分配条款允许不足额顺延（除 (k)
+外），取 True；够花明确「不足部分下一期不予补足」，取 False。默认 False 时，
+未付部分直接消失、不上滚。
 """
 
 from dataclasses import dataclass
@@ -94,6 +108,10 @@ class Pool:
     recovery_distribution: tuple = ()  # 回收按月分布权重；空 = 用 recovery_lag_months 定点滞后
     purchase_base: str = "principal"   # 可购买资金口径：principal / available（见下）
     security_cost_rate: float = 0.0    # 证券利息成本（年化，按初始资产池余额计提），仅 available 模式用
+    # ---- 次级期间收益（第 8 周 P1-4）----
+    sub_share: float = 0.0             # 次级分层占比（循环期次级未偿本金 = 初始池 × 该占比）
+    sub_income_rate: float = 0.0       # 次级期间收益率（年化），0 表示不付
+    sub_income_carry: bool = False     # 期间收益不足额是否顺延（鼎柚 True、够花 False）
 
     @classmethod
     def from_dict(cls, d):
@@ -117,6 +135,9 @@ class Pool:
                 float(x) for x in (d.get("recovery_distribution") or [])),
             purchase_base=str(d.get("purchase_base", "principal")),
             security_cost_rate=float(d.get("security_cost_rate", 0.0)),
+            sub_share=float(d.get("sub_share", 0.0)),
+            sub_income_rate=float(d.get("sub_income_rate", 0.0)),
+            sub_income_carry=bool(d.get("sub_income_carry", False)),
         )
 
     def monthly_rate(self):

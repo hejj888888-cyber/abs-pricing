@@ -125,7 +125,26 @@
 故这个式子与瀑布按「未偿本金 × 票面」算出的应付利息精确相等。早期用当期
 `live` 近似，队列摊还后会偏小，正是修复后第 2 月冒出欠息误报的原因。
 
-仍未纳入次级期间收益（够花 p.44 不超过 3%/年），属于 P1-4，本轮未改。
+## 第 8 周：次级期间收益（P1-4）
+
+上一版把次级期间收益完全交给瀑布、且在**本金分配之后**支付，顺序与条款不符；
+`available` 口径下又允许收入剩余全额转去购买，等于先把次级该拿的钱买成了资产。
+
+现在按两单合同拆分（鼎柚 p.47 (j)、p.48 (a)；够花 p.44 (9)、p.45 (1)）：
+
+    senior_required     = 服务费 + 税费 + 优先档利息（+ 流动性储备，两单均为 0）
+    topup               = min(max(senior_required − interest, 0), principal_cash)
+    income_after_senior = max(interest + topup − senior_required, 0)
+    sub_due             = 初始池 × 次级占比 × 3%/12 + 上期顺延
+    sub_paid            = min(sub_due, income_after_senior)
+    income_transfer     = income_after_senior − sub_paid
+
+关键点：**本金账户的补足范围只到优先档**，不能替次级付收益，所以 `topup` 只覆盖
+`senior_required`；次级收益只能从收入账户自身的剩余里出。交给瀑布的现金
+`= senior_required + sub_paid`，瀑布再把次级期间收益排在本金之前支付，两边金额一致。
+
+`sub_income_carry` 按条款配置：鼎柚一般分配条款允许不足额顺延（除 (k) 外）取
+True，够花「不足部分下一期不予补足」取 False。
 """
 
 import math
@@ -257,6 +276,7 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
     cum_co = 0.0
     cum_purchased = 0.0       # 持续购买累计本金，累计违约率分母的组成部分
     prin_acct = 0.0           # 本金分账户余额（跨月结转）
+    sub_arrears = 0.0         # 次级期间收益未付额（仅 sub_income_carry=True 时上滚）
     cum_gross_principal = 0.0
     cum_recovery = 0.0
     first_amort_month = rev + 1
@@ -323,6 +343,8 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
         income_transfer = 0.0
         topup = 0.0
         income_required = 0.0
+        sub_due = 0.0
+        sub_paid = 0.0
         sweep = 0.0
         net_principal = 0.0
         # 交给瀑布的现金。principal 口径下就是完整利息 + 本金（历史行为，逐行等价）；
@@ -344,7 +366,18 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
                 # 让完整利息进入瀑布形成 reserve（同一笔剩余收入被使用两次）。
                 # 现在补足款受本金账户余额约束，收入账户净额原样交给瀑布。
                 topup = min(max(income_required - interest, 0.0), principal_cash)
-                income_transfer = max(interest - income_required, 0.0)
+                income_after_senior = max(interest + topup - income_required, 0.0)
+
+                # 第 8 周 P1-4：次级期间收益排在优先档之后、剩余转入本金之前。
+                # 本金账户的补足范围只到优先档（鼎柚 p.47 (a)–(h)、够花 p.43–44
+                # (1)–(5)），不能替次级付收益，所以 sub_paid 只能来自
+                # income_after_senior。不足额是否顺延按两单条款配置（carry）。
+                sub_due = (pool.balance * pool.sub_share * pool.sub_income_rate / 12.0
+                           + sub_arrears)
+                sub_paid = min(max(sub_due, 0.0), income_after_senior)
+                sub_arrears = (sub_due - sub_paid) if pool.sub_income_carry else 0.0
+
+                income_transfer = income_after_senior - sub_paid
                 purchase_cash = principal_cash - topup + income_transfer
                 available = purchase_cash
                 waterfall_cash = interest + topup - income_transfer
@@ -386,6 +419,8 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
             "servicing_fee": fee,
             "tax": tax,
             "income_required": income_required,   # 收入账户应付（费+税+证券利息），仅 available 口径
+            "sub_income_due": sub_due,            # 次级期间收益应付（含上期顺延），仅 available 口径
+            "sub_income_paid": sub_paid,          # 次级期间收益实付，仅 available 口径；principal 由瀑布直接付
             "income_transfer": income_transfer,   # 收入分账户剩余转入本金分账户
             "prin_topup": topup,                  # 本金分账户实际补足收入分账户缺口（受余额约束）
             "prin_sweep": sweep,                  # 摊还期初始清扫的留存现金

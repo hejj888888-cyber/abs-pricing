@@ -115,12 +115,13 @@ def read_csv(path):
         return list(csv.reader(f))
 
 
-def diff_report(base_dir):
-    before = os.path.join(base_dir, "before")
-    after = os.path.join(base_dir, "after")
-    lines = ["# P0-D 修复前后基线逐行 diff", "",
-             "> 由 `python scripts/export_baseline.py --diff` 生成。"
-             "快照为不截断循环期的纯引擎轨迹，两单 × 全部情景 × 两种口径。", "",
+def diff_report(base_dir, left="before", right="after"):
+    before = os.path.join(base_dir, left)
+    after = os.path.join(base_dir, right)
+    lines = ["# 基线逐行 diff：{} → {}".format(left, right), "",
+             "> 由 `python scripts/export_baseline.py --diff --left {} --right {}` 生成。"
+             .format(left, right)
+             + "快照为不截断循环期的纯引擎轨迹，两单 × 全部情景 × 两种口径。", "",
              "## 一、逐月全字段 diff（CSV）", "",
              "| 组 | 修复前行数 | 修复后行数 | 差异单元格 | 差异字段（前 4） | 首个差异月 |",
              "|---|---:|---:|---:|---|---|"]
@@ -221,7 +222,7 @@ def diff_report(base_dir):
                     break
         lines.append("")
 
-    path = os.path.join(base_dir, "diff-report.md")
+    path = os.path.join(base_dir, "diff-{}--vs--{}.md".format(left, right))
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     print("[diff] 默认 principal 路径差异组数 = {}".format(n_bad_principal))
@@ -233,9 +234,11 @@ def main():
     ap.add_argument("--tag", help="before / after")
     ap.add_argument("--diff", action="store_true")
     ap.add_argument("--base", default=BASE_DIR)
+    ap.add_argument("--left", default="before", help="diff 左侧快照目录名")
+    ap.add_argument("--right", default="after", help="diff 右侧快照目录名")
     args = ap.parse_args()
     if args.diff:
-        diff_report(args.base)
+        diff_report(args.base, args.left, args.right)
     elif args.tag:
         snapshot(args.tag, args.base)
     else:
