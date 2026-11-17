@@ -122,12 +122,58 @@ def run_scenario(pool, tranches, structure, sc, vintage=None, terms=None,
 
 
 def check_conservation(rows, result):
+    """三条守恒恒等式 + 1 元绝对容差（第 9 周 P2-1）。
+
+    三条逐月恒等式（principal / available、循环期 / 摊还期都成立）：
+        本金账户：P[t-1] + G[t] + R[t] + T[t] = U[t] + B[t] + D[t] + P[t]
+        收入账户：C[t] = I[t] + U[t] - T[t] + D[t]      （等价于 waterfall_cash + D）
+        全期瀑布：ΣC = Σfee + Σtax + Σ各档实付 + excess_servicing + 期末未分配现金
+
+    其中 P=prin_acct（月末）、G=gross_principal、R=recovery、T=income_transfer、
+    U=prin_topup、B=purchase、D=principal（分配给证券的本金，不是 distribute_principal
+    那个布尔开关）、C=total_collection、I=interest。
+
+    注意：旧实现只检查最后一式，且用 1e-4 的相对容差。相对容差在 16 亿量级上
+    允许 16 万残差，足以掩盖 P0-D 那类「等式两边同时漏记」的错误——两条子账
+    恒等式必须单独查，且容差收紧到 1 元绝对。
+
+    返回 (ok, gap)，gap 为主式（全期瀑布）残差，供现有调用点显示。
+    """
+    TOL = 1.0  # 元，绝对容差
+
+    # 1) 本金账户恒等式（逐月）
+    prev = 0.0
+    acct_gap = 0.0
+    for r in rows:
+        lhs = (prev + r["gross_principal"] + r["recovery"]
+               + r["income_transfer"])
+        rhs = (r["prin_topup"] + r["purchase"] + r["principal"]
+               + r["prin_acct"])
+        acct_gap = max(acct_gap, abs(lhs - rhs))
+        prev = r["prin_acct"]
+
+    # 2) 收入账户恒等式（逐月）
+    income_gap = 0.0
+    for r in rows:
+        lhs = r["total_collection"]
+        rhs = (r["interest"] + r["prin_topup"]
+               - r["income_transfer"] + r["principal"])
+        income_gap = max(income_gap, abs(lhs - rhs))
+
+    # 3) 全期瀑布恒等式
     inflow = sum(r["total_collection"] for r in rows)
     fee = sum(r["servicing_fee"] for r in rows)
     tax = sum(r.get("tax", 0.0) for r in rows)
     paid = sum(sum(cfs) for cfs in result.cashflow.values())
-    gap = inflow - fee - tax - paid
-    return abs(gap) < 1e-4 * max(1.0, inflow), gap
+    excess = getattr(result, "excess_servicing", 0.0)
+    # 期末未分配现金：本金账户月末余额。
+    # 注意 reserve 不能加在这里——run_waterfall 在构造 WaterfallResult 之前
+    # 已经把 reserve 全额计入 cf[residual][-1]，再加一次会重复计入。
+    unallocated = rows[-1]["prin_acct"] if rows else 0.0
+    gap = inflow - (fee + tax + paid + excess + unallocated)
+
+    ok = (abs(gap) <= TOL and acct_gap <= TOL and income_gap <= TOL)
+    return ok, gap
 
 
 def write_schedule_csv(path, rows):
@@ -935,6 +981,18 @@ def run_one(case_path, out_dir, quiet=False):
     scenarios = case["scenarios"]
     vintage = vintage_from_dict(case.get("vintage"))
     terms = TriggerTerms.from_dict(case.get("triggers"))
+
+    # P2-3：分层占比与披露超额抵押率（oc_rate）的一致性断言。
+    # 1 − Σshare 是「资产池初始余额中没有被证券覆盖的部分」，应等于披露 OC 率。
+    # 容差 5e-6：分层占比只保留六位小数（鼎柚 1−Σshare=0.002121 vs 披露 0.002122）。
+    computed = case.get("computed") or {}
+    oc_rate = computed.get("oc_rate")
+    if oc_rate is not None:
+        implied_oc = 1.0 - sum(t.share for t in tranches)
+        if abs(implied_oc - float(oc_rate)) > 5e-6:
+            raise ValueError(
+                "{}: 分层占比隐含 OC {:.9f} 与披露 oc_rate {:.9f} 不一致（容差 5e-6）".format(
+                    case.get("case_id", "case"), implied_oc, float(oc_rate)))
 
     rows0 = build_schedule(pool, vintage=vintage)
     solve_coupons(rows0, pool.balance, tranches, structure.get("pay_mode", "sequential"),

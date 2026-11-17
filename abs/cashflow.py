@@ -281,8 +281,15 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
     cum_recovery = 0.0
     first_amort_month = rev + 1
     m = 1
-    # 多留队列期数与回收分布长度，保证最后一笔核销的分布尾部也落进主循环
-    end = rev + pool.amort_months + 24 + len(rec_weights) + _periods
+    # 第 9 周 P2-2：可证明的安全上界，取代原来的 amort_months + 24 魔数。
+    #   · 最晚的新队列在 rev+1 月成立（第 rev 月购买、次月起息）；
+    #   · 单个队列最长运行 _periods 月，最后一笔资产现金流最晚在 rev+_periods；
+    #   · 回收分布的最大偏移是 len(weights)-1；
+    #   · 再留 1 个月用于账户清扫和终止检查（摊还期首个只付息日需要）。
+    # 因此 rev + _periods + len(weights) 之后仍不满足终止条件，说明引擎有 bug，
+    # 应当抛异常而不是静默截断——静默截断会悄悄丢掉尾部现金。
+    hard_end = rev + _periods + len(rec_weights)
+    end = hard_end
 
     while m <= end:
         interest = 0.0
@@ -433,14 +440,25 @@ def _build(pool, co_mult, mrr_mult, recovery_mult, yield_mult, vintage=None,
             "cum_default_rate": cum_co / (pool.balance + cum_purchased),
         })
 
-        # 余额归零后仍可能有未到期的回收事件，主循环继续跑到事件表清空，
-        # 因此不再需要单独的尾部补记循环，也不会被 capping 截断。
-        if m > rev and live <= 1e-6 and not recovery_events:
+        # 第 9 周 P2-2：可证明终止条件。四个条件缺一不可——
+        #   队列全部清空 + 回收事件表为空 + 本金账户清扫完毕 + 已进入摊还期。
+        # 旧条件只看 live 和 recovery_events，会在「摊还首个只付息月」或
+        # 「尾部回收恰好落在该月」时提前退出，丢掉 prin_acct 里的留存。
+        if (m > rev and live <= 1e-6 and not recovery_events
+                and prin_acct <= 1e-6):
             break
 
         if purchase > 0:
             add_cohort(purchase, m + 1)
         m += 1
+    else:
+        # while 走到上界仍未满足终止条件：这是引擎错误，不能静默返回。
+        raise RuntimeError(
+            "cashflow 未在上界内收敛：month={}, rev={}, periods={}, "
+            "live={:.2f}, prin_acct={:.2f}, pending_recovery={}".format(
+                end, rev, _periods,
+                sum(c["face"] - c["prin_paid"] - c["loss_rec"] for c in cohorts),
+                prin_acct, len(recovery_events)))
 
     return rows
 

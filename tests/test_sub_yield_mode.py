@@ -29,7 +29,8 @@ class TestSubYieldMode(unittest.TestCase):
         for cid, stem in (("dingyou", "dingyou_2025_3"),
                           ("gouhua", "gouhua_2025_2")):
             path = os.path.join(ROOT, "cases", stem + ".json")
-            case = json.load(open(path, encoding="utf-8"))
+            with open(path, encoding="utf-8") as f:
+                case = json.load(f)
             run_one(path, cls.out, quiet=True)
             with open(os.path.join(cls.out,
                                    f"{case['case_id']}_report.md"),
@@ -42,10 +43,12 @@ class TestSubYieldMode(unittest.TestCase):
 
     def test_case_configuration(self):
         """两单必须显式配置口径，且方向相反。"""
-        dy = json.load(open(os.path.join(ROOT, "cases", "dingyou_2025_3.json"),
-                            encoding="utf-8"))
-        gh = json.load(open(os.path.join(ROOT, "cases", "gouhua_2025_2.json"),
-                            encoding="utf-8"))
+        with open(os.path.join(ROOT, "cases", "dingyou_2025_3.json"),
+                  encoding="utf-8") as f:
+            dy = json.load(f)
+        with open(os.path.join(ROOT, "cases", "gouhua_2025_2.json"),
+                  encoding="utf-8") as f:
+            gh = json.load(f)
         self.assertEqual(dy["structure"]["sub_yield_mode"], "interval")
         self.assertEqual(gh["structure"]["sub_yield_mode"], "point")
         self.assertIn("收费文件", dy["structure"]["sub_yield_mode_note"])
