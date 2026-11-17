@@ -30,7 +30,9 @@
     "trigger_cdr": 0.05,
     "trigger_note": "已改用 triggers 多条件触发；trigger_cdr 仅在 triggers 缺失时作为旧逻辑兜底。",
     "sub_income_carry": false,
-    "sub_income_carry_note": "够花说明书 p.44(9)：次级期间收益可分配资金不足时，不足部分下一期不予补足，故取 false。"
+    "sub_income_carry_note": "够花说明书 p.44(9)：次级期间收益可分配资金不足时，不足部分下一期不予补足，故取 false。",
+    "sub_yield_mode": "point",
+    "sub_yield_mode_note": "P1-6：够花公开分配顺序没有后端服务报酬科目，偿还次级本金后的剩余全部作为次级收益，按 excess_sweep=0 报条件性模型点估计；原 0%–100% 区间作废。"
   },
   "vintage": {
     "enabled": false,

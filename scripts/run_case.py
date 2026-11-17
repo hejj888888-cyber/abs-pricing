@@ -215,6 +215,21 @@ def benchmark_section(case, pool, tranches, results, summaries):
         ["累计放款 / 初始池", f"{(pool.balance + sum(r['purchase'] for r in rows)) / pool.balance:.2f}x", "—", "—"],
     ]))
 
+    # P1-2/P2-4：税费的「隐含基数」反推（不称真实计税基数）。
+    # 披露税费 ÷ 3.26% 得到一个隐含计税基数，与披露的回收款利息（合同利息的
+    # 可见代理）比较；差额就是未公开的其他计税收入（手续费/罚息/账户利息等）。
+    tax_disc = disc.get("税费")
+    interest_disc = disc.get("回收款利息")
+    if tax_disc and interest_disc:
+        implied = tax_disc / 0.0326
+        excess_v = implied - interest_disc
+        L.append("\n**税费的隐含基数（P1-2）**：披露税费 {:,.2f} 万元 ÷ 3.26% = **{:,.2f} 万元**，"
+                 "而披露回收款利息为 {:,.2f} 万元，隐含基数高出 **{:,.2f} 万元（{:.2f}%）**。"
+                 "这一差额对应公开交易文件列示但未披露逐月金额的其他计税收入（手续费、罚息、"
+                 "复利、违约金/滞纳金、违约贷款相关收入、信托账户利息、合格投资收益等）。"
+                 "注意这是**隐含基数**，不是「真实计税基数」——公开文件不足以还原后者的构成。\n".format(
+                     tax_disc, implied, interest_disc, excess_v, excess_v / interest_disc * 100))
+
     # 修复前后的 GAP 对照：第 5 周把累计核销改成「总量锁定 + 时序分配」，
     # 这张表的偏差会整体移动，甚至可能反向。把两列并排放，避免只报好的一面。
     pre = bm.get("pre_fix_netloss_wan")
@@ -270,7 +285,8 @@ def benchmark_section(case, pool, tranches, results, summaries):
     L.append("\n> **这一层是分配端的检验，不是流入端的。** 把披露的流入端合计"
              "（流入合计 − 持续购买支出 − 税费 − 各档利息）代入顺序偿付瀑布，"
              "算术上必然得到披露的各档实付金额——上面这行勾稽在两单都精确成立，"
-             "说明本模型的瀑布顺序、税费计提、次级期间收益封顶与真实结构一致。"
+             "但它是**用披露汇总数做的算术验证**，只能说明瀑布顺序与税费封顶自洽，"
+             "不能证明评级机构内部用了同一套分配。模型自身分配结果已在 P1-4 后重新验证；"
              "剩下的一切偏差都来自流入端，也就是资产模型。\n")
     return L
 
@@ -519,7 +535,7 @@ def thickness_analysis(tranches, scenario_metrics):
 
 
 def build_report(case, pool, tranches, results, summaries, min_sub, counterfactual=None,
-                 sub_yield_low=None, sub_yield_high=None):
+                 sub_yield_low=None, sub_yield_high=None, sub_yield_mode="interval"):
     scenario_metrics = [r[2] for r in results]
     structure = case.get("structure", {})
     # 加权票面按「有票面的档」加权，不能只算 mode == "solve"——
@@ -664,11 +680,10 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
                      "{:,.0f} 万元，循环期被砍掉 {} 个月。\n".format(
                          wan(purch_full), wan(purch_trunc),
                          pool.revolving_months - (results[idx_aaa][1].revolving_cap or 0)))
-            L.append("结论：**评级机构这次压力测试是把压力参数代入现金流模型直接跑，"
-                     "没有再叠加触发机制的时序反馈。** 这不是疏漏——压力测试的目的是判断"
-                     "给定恶化程度下证券能否足额兑付，触发机制的时序反馈会引入第二个自由度，"
-                     "使结果不再只由压力参数决定。本报告第二节之二的对表因此统一在"
-                     "「不截断循环期」口径下进行，与披露口径一致。\n")
+            L.append("披露的累计购买支出在数值上更接近本模型未截断循环期的结果。"
+                     "公开文件未披露压力测试中触发事件的判定时点、现金流重跑方式及两者的"
+                     "迭代顺序，因此本节仅将未截断结果作为数值对照，**不据此认定评级机构"
+                     "是否叠加了触发机制反馈**。\n")
         else:
             L.append("\n### 为什么累计违约率条款触发不了\n")
             L.append("按合同口径，本单三情景的累计违约率峰值 **{}**，首年阈值 {}，{}。\n".format(
@@ -701,11 +716,12 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
         L.append(md_table(["档位", "披露预期到期日（折月）", "模型清偿月", "差异"], rec_rows))
         gaps = [int(r[3].split()[0]) for r in rec_rows if r[3] != "—"]
         if gaps and max(gaps) > 0:
-            L.append("\n模型比披露口径慢 {} 个月。月还款率已按评级方法 p.6 改为"
-                     "「初始放款金额 × 月还款率」的水平偿还（不再是几何衰减），"
-                     "残余差异来自两点：一是评级方法 p.5–6 写明正常摊还期本金先积累、"
-                     "按约定日偿还，本模型仍在每月过手；二是披露的预期到期日还含"
-                     "支付日日历、税费与次级期间收益的排布，并非由月还款率单独推出。".format(max(gaps)))
+            L.append("\n两单评级报告均明确摊还期采用按月付息、过手还本，模型的本金分配方向与"
+                     "披露一致；鼎柚摊还期首个支付日只付息不还本也已单独实现。因此，残余 {} 个月"
+                     "差异**不能归因于「按月过手与约定日偿还」的选择**。公开汇总数据下，差异可能"
+                     "来自月度 cohort 的水平本金近似、整月队列寿命、收款期与支付日的日历离散化，"
+                     "以及未披露的逐笔剩余期限和逐月回款分布；各因素无法单独识别，保留为 GAP，"
+                     "不通过调参消除。".format(max(gaps)))
             L.append("\n> 这是一个**没有修正的已知偏差**，故意留着：修正它需要静态池的逐月摊还表，"
                      "而披露文件只有汇总的月还款率。把它列出来，比调参数把数字凑上去更诚实。\n")
 
@@ -736,12 +752,19 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
               if sev_loss > sub.share else "未超过次级厚度")
     L.append("极端情景净损失 {}，{}；次级实际损失 {}（约合资产池 {}），其中 {} 被超额利差吸收。".format(
         pct(sev_loss), pierce, pct(sub_loss), pct(sub_loss * sub.share), pct(absorbed)))
-    L.append("\n> **次级档的实现收益率只能给区间，给不出点估计。** 说明书的分配顺序末端是"
-             "「先支付后端服务报酬，再由次级取得剩余收益」，即次级拿到的是扣完后端报酬之后的"
-             "余额；而后端报酬的计算方式由《收费文件》约定，该文件不公开。取后端报酬占期末剩余"
-             "的 0% 与 100% 两种极端，得到本单次级收益率的区间 **{} ~ {}**；"
-             "真实值落在区间内某处，位置由那份不公开的收费文件决定。\n".format(
-                 pct(sub_yield_low), pct(sub_yield_high)))
+    if sub_yield_mode == "point":
+        L.append("\n> **次级档收益按公开分配顺序报条件性模型点估计。** 本单的公开分配顺序"
+                 "没有后端服务报酬科目，偿还次级本金后的剩余资金全部作为次级收益，因此按 "
+                 "`excess_sweep=0` 报出 **{}**。这是基于公开分配顺序的条件性模型结果，"
+                 "**不是市场报价**；原 0%–100% 后端报酬区间对本单不适用，已撤销。\n".format(
+                     pct(sub_yield_high)))
+    else:
+        L.append("\n> **次级档的实现收益率只能给条件区间，给不出点估计。** 说明书的分配顺序末端是"
+                 "「先支付后端服务报酬，再由次级取得剩余收益」，即次级拿到的是扣完后端报酬之后的"
+                 "余额；而后端报酬的计算方式由《收费文件》约定，该文件不公开。取后端报酬占期末剩余"
+                 "的 0% 与 100% 两种极端，得到本单次级收益率的区间 **{} ~ {}**；"
+                 "真实值落在区间内某处，位置由那份不公开的收费文件决定。两者都不是市场报价。\n".format(
+                     pct(sub_yield_low), pct(sub_yield_high)))
 
     L.append("\n## 六、厚度反解 vs 披露结构\n")
     L.append("反解问题：在极端情景下，次级档最薄做到多少，其余各档仍不违约？\n")
@@ -873,23 +896,29 @@ def build_report(case, pool, tranches, results, summaries, min_sub, counterfactu
              "本模型取后者；披露结果隐含的净损失更接近前者，这一条是当前最大的口径不确定性，"
              "详见 `docs/loss-conservation.md` 第七节。账龄曲线仍作为敏感性开关保留，基准不启用"
              "（见 `docs/inflow-calibration.md` 第五节）。")
-    L.append("5. 摊还期本金按月过手，而评级方法 p.5–6 写明正常摊还期本金先积累、按约定日偿还；"
-             "这是第二节对账表残余 1–2 个月偏差的主因，未修正。")
-    L.append("6. **次级档实现收益率是上界，不是点估计。** 本模型把收入分账的全部剩余（超额利差）都归次级。"
-             "真实交易通常约定「超额服务费」——服务商在所有档位获得约定收益后取走剩余——"
-             "此时次级收益会显著低于此数。两种安排的分界就在《服务合同》/收费文件里，而该文件不公开，"
-             "故本报告只能给出上界，并把「缺这份文件」列为核心数据缺口。")
+    L.append("5. 摊还期本金分配已按两单披露建模为按月过手；鼎柚摊还期首个支付日只付息不还本"
+             "亦已实现。模型清偿月与披露预期到期日仍有 1–2 个月差异，公开数据不足以在月度"
+             "队列近似、支付日日历和逐笔期限分布之间分解该偏差，因此保留为 GAP。")
+    L.append("6. **次级收益口径按交易文件分别处理。** 鼎柚的本金分配顺序在偿还次级本金后先支付"
+             "贷款服务机构后端服务报酬，再将剩余资金分给次级；其计算算法由《收费文件》约定且未公开，"
+             "因此仅报告 0% 与 100% 抽取边界形成的条件区间。够花的公开分配顺序没有后端服务报酬科目，"
+             "偿还次级本金后的剩余资金全部作为次级收益，因此按 `excess_sweep=0` 报告条件性模型点估计，"
+             "不再套用 0%–100% 区间。上述点估计或区间均不是市场报价。")
     L.append("7. 核销后回收率与回收周期（6 个月）为披露值，未按催收渠道分层。基准把回收款"
              "放在第 6 月一次性到账；`recovery_distribution` 支持按月分布，但公开文件没有"
              "给出分布形状，任何非空取值都是显式建模假设，只用于第二节之三的敏感性分析。")
     L.append("8. 票面为发行结果的实际值（`mode: fixed`），不再由模型反解——面值发行下反解票面是循环论证，"
              "详见 `docs/param-calibration.md`。")
-    L.append("9. 税费按披露税率 3.26% 对利息收入计提、费率按披露合计值计提；"
-             "未计入流动性溢价、中介发行费用与外部增信。评级报告披露的税费高于「利息 × 3.26%」，"
-             "计税基数口径未在公开文件中说明。")
+    L.append("9. 税率 3.26% 为评级报告披露值。公开交易文件显示，计税收入不只可能包含合同利息，"
+             "还包括具有利息性质的手续费、罚息、复利、违约金/滞纳金、违约贷款相关收入、信托账户"
+             "利息和合格投资收益等。但公开文件未披露上述组成项的逐月金额，因此模型暂以"
+             "「合同利息 × 3.26%」作语义映射，该实现不能复现评级报告披露税费，差额保留为 GAP。"
+             "未计入流动性溢价、中介发行费用与外部增信。")
     L.append("10. 联合资信方法 p.7 还有一条**未建模**的兜底条款：「对最大核销率设定了一个最低值，"
              "当基准情景核销率乘上相应乘数后小于该最低值时，要以该最低值作为最大核销率」。"
-             "两单乘数后均远高于任何合理下限，暂不影响结果，但兜底值本身未披露。")
+             "该方法表未披露最低值本身；两单项目评级报告已经直接披露最终压力核销率 17.27% 和"
+             "29.10%，因此本模型直接使用项目披露值，不再通过评级方法表反推最低值。对于未披露"
+             "最终压力参数的新案例，该最低值无法由公开资料实现，明确标记为 GAP。")
     L.append("11. **「二之二」对表那一栏统一在「不截断循环期」口径下进行**，以便与披露值可比；"
              "第二节情景表与第七节则保留触发反馈（加速清偿→停止持续购买）。评级机构是否叠加触发，"
              "公开文件只给了结论、没给逐月判定顺序，故本报告只写「披露值更接近未叠加口径」，"
@@ -944,9 +973,15 @@ def run_one(case_path, out_dir, quiet=False):
                            structure.get("trigger_cdr", 0.06), terms, excess_sweep=1.0)
     sub_yield_high = tranche_metrics(res_hi, tranches[-1])["实现收益率"]
     sub_yield_low = tranche_metrics(res_lo, tranches[-1])["实现收益率"]
+    # P1-6：够花的公开分配顺序没有后端服务报酬科目，撤销 0%–100% 区间，
+    # 只按 excess_sweep=0 报条件性模型点估计（不是市场报价）。
+    sub_yield_mode = structure.get("sub_yield_mode", "interval")
+    if sub_yield_mode == "point":
+        sub_yield_low = None
 
     report = build_report(case, pool, tranches, results, summaries, min_sub,
-                          counterfactual, sub_yield_low, sub_yield_high)
+                          counterfactual, sub_yield_low, sub_yield_high,
+                          sub_yield_mode=sub_yield_mode)
     md_path = os.path.join(out_dir, f"{cid}_report.md")
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(report)
