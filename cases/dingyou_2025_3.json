@@ -18,6 +18,8 @@
     "revolving_months": 8,
     "amort_months": 13,
     "reinvest_rate": 1.0,
+    "purchase_base": "available",
+    "purchase_base_note": "P0-B：按现行联合资信 V4.0.202406 p.10『当月新增资产规模/当月可用于购买的资金』及说明书 p.48 收入账户剩余转入本金账户条款，正式案例统一采用 available；principal 仅作旧版简化敏感性。",
     "seasoning_months": 5,
     "tax_rate": 0.0326,
     "revolving_first_pay_interest_only": true,
